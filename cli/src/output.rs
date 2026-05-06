@@ -2275,37 +2275,55 @@ The output file can be viewed in:
         // === Record (video) ===
         "record" => {
             r##"
-agent-browser record - Record browser session to video
+agent-browser record - Record browser session to a natural-looking video
 
-Usage: agent-browser record start <path.webm> [url]
+Usage: agent-browser record start <path.webm> [url] [flags]
        agent-browser record stop
-       agent-browser record restart <path.webm> [url]
+       agent-browser record restart <path.webm> [url] [flags]
 
-Record the browser to a WebM video file.
-Creates a fresh browser context but preserves cookies and localStorage.
-If no URL is provided, automatically navigates to your current page.
+Records the browser to a WebM (or .mp4) file. Creates a fresh browser
+context but preserves cookies and localStorage. If no URL is given,
+navigates to your current page.
+
+Defaults are tuned to look HUMAN, not robotic:
+  - Visible cursor overlay that animates to each click/hover/fill target
+  - Per-keystroke typing delays with jitter (so text appears letter-by-letter)
+  - 10 FPS capture (use --fps 30 for smoother cursor on capable hardware)
+Pass --robotic to opt out of all of these and get the legacy zero-pacing mode.
 
 Operations:
-  start <path> [url]     Start recording (defaults to current URL if omitted)
-  stop                   Stop recording and save video
-  restart <path> [url]   Stop current recording (if any) and start a new one
+  start <path> [url] [flags]    Start recording (defaults to current URL if omitted)
+  stop                          Stop recording and save video
+  restart <path> [url] [flags]  Stop current recording (if any) and start a new one
+
+Natural-mode flags (override individual defaults):
+  --auto-cursor / --no-auto-cursor  Force-enable / force-disable the cursor overlay
+  --robotic                         Disable cursor + delays + drop to 10 FPS (legacy)
+  --type-delay <ms>                 Delay between keystrokes (default 65)
+  --type-jitter <ms>                Random jitter added to --type-delay (default 25)
+  --mouse-duration <ms>             Cursor animation duration (default 450, floor 200)
+  --settle-ms <ms>                  Pause after the cursor lands (default 250)
+  --fps <n>                         Capture frame rate, 1..=60 (default 10; bump to 30 for smoother cursor)
+  --log-actions <path>              Write a JSONL action timeline alongside the video
 
 Global Options:
   --json               Output as JSON
   --session <name>     Use specific session
 
 Examples:
-  # Record from current page (preserves login state)
+  # Natural-looking demo from current page
   agent-browser open https://app.example.com/dashboard
-  agent-browser snapshot -i            # Explore and plan
   agent-browser record start ./demo.webm
-  agent-browser click @e3              # Execute planned actions
+  agent-browser find role link click --name "Settings"
   agent-browser record stop
 
-  # Or specify a different URL
-  agent-browser record start ./demo.webm https://example.com
+  # Capture an action timeline for downstream voiceover script generation
+  agent-browser record start ./demo.webm --log-actions ./demo.actions.jsonl
 
-  # Restart recording with a new file (stops previous, starts new)
+  # Legacy zero-pacing mode
+  agent-browser record start ./demo.webm --robotic
+
+  # Restart recording with a new file
   agent-browser record restart ./take2.webm
 "##
         }

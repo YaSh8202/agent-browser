@@ -354,6 +354,64 @@ agent-browser diff url https://v1.com https://v2.com --wait-until networkidle  #
 agent-browser diff url https://v1.com https://v2.com --selector "#main"  # Scope to element
 ```
 
+### Recording (demo videos)
+
+Record the active session to a `.webm` or `.mp4` file. Defaults are tuned to
+produce **human-looking** demos -- a visible cursor that animates to each
+target, per-keystroke typing delays with jitter, and 30 FPS capture. Use
+`--robotic` to opt out and get the legacy zero-pacing behaviour.
+
+```bash
+agent-browser record start <output>       # Start a natural-mode recording
+agent-browser record start <output> [url] # Optionally navigate to a URL first
+agent-browser record stop                 # Finalise and close the recording
+agent-browser record restart <output>     # Stop current recording, start a new one
+```
+
+**Flags** (all optional, all on `record start` and `record restart`):
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--auto-cursor` / `--no-auto-cursor` | on | Inject the visible cursor overlay; `--no-auto-cursor` hides it |
+| `--robotic` | off | Shorthand: disable cursor, instant clicks, bulk text insert, 10 FPS |
+| `--type-delay <ms>` | 65 | Delay between keystrokes in `type` and `fill` |
+| `--type-jitter <ms>` | 25 | Random jitter added on top of `--type-delay` |
+| `--mouse-duration <ms>` | 450 (floor 200) | Cursor animation duration before clicks/hovers |
+| `--settle-ms <ms>` | 250 | Pause after the cursor lands, before the action fires |
+| `--fps <n>` | 10 | Capture frame rate (1–60). Bump to 30 for smoother cursor motion if your machine can keep up encoding |
+| `--log-actions <path>` | _none_ | Write a JSONL action timeline alongside the video |
+
+**Action log JSONL schema** -- one entry per user-visible action
+(`click`, `dblclick`, `hover`, `fill`, `type`, `press`, `scroll`, `select`,
+`check`, `uncheck`, `navigate`):
+
+```json
+{
+  "action": "click",
+  "args": { "selector": "@e7", "button": "left", "clickCount": 1 },
+  "target": { "x": 612, "y": 384 },
+  "tsMs": 1820,
+  "frameIdx": 54,
+  "durationMs": 712,
+  "ok": true
+}
+```
+
+`tsMs` is milliseconds since `record start`; `frameIdx` is the captured
+frame index when the action ran; `target` is the viewport pixel where the
+cursor landed (omitted for actions without a positional target like `press`
+or `navigate`). Designed so a downstream voiceover script can be aligned to
+the video timeline by frame index or by ts.
+
+**Example** -- record a 30-second tour of github.com:
+
+```bash
+bash scripts/demo-github.sh ./demo.webm
+```
+
+This writes `./demo.webm` and `./demo.actions.jsonl` (one JSON object per
+action). See `scripts/demo-github.sh` for the source.
+
 ### Debug
 
 ```bash

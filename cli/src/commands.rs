@@ -1394,42 +1394,22 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
             const VALID: &[&str] = &["start", "stop", "restart"];
             match rest.first().copied() {
                 Some("start") => {
-                    let path = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
-                        context: "record start".to_string(),
-                        usage: "record start <output.webm> [url]",
-                    })?;
-                    // Optional URL parameter
-                    let url = rest.get(2);
-                    let mut cmd = json!({ "id": id, "action": "recording_start", "path": path });
-                    if let Some(u) = url {
-                        // Add https:// prefix if needed (preserve special schemes)
-                        let url_str = if u.starts_with("http") || u.contains("://") {
-                            u.to_string()
-                        } else {
-                            format!("https://{}", u)
-                        };
-                        cmd["url"] = json!(url_str);
-                    }
+                    let cmd = parse_record_args(
+                        &id,
+                        "recording_start",
+                        "record start <output.webm> [url] [flags]",
+                        &rest[1..],
+                    )?;
                     Ok(cmd)
                 }
                 Some("stop") => Ok(json!({ "id": id, "action": "recording_stop" })),
                 Some("restart") => {
-                    let path = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
-                        context: "record restart".to_string(),
-                        usage: "record restart <output.webm> [url]",
-                    })?;
-                    // Optional URL parameter
-                    let url = rest.get(2);
-                    let mut cmd = json!({ "id": id, "action": "recording_restart", "path": path });
-                    if let Some(u) = url {
-                        // Add https:// prefix if needed (preserve special schemes)
-                        let url_str = if u.starts_with("http") || u.contains("://") {
-                            u.to_string()
-                        } else {
-                            format!("https://{}", u)
-                        };
-                        cmd["url"] = json!(url_str);
-                    }
+                    let cmd = parse_record_args(
+                        &id,
+                        "recording_restart",
+                        "record restart <output.webm> [url] [flags]",
+                        &rest[1..],
+                    )?;
                     Ok(cmd)
                 }
                 Some(sub) => Err(ParseError::UnknownSubcommand {
@@ -1438,7 +1418,7 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                 }),
                 None => Err(ParseError::MissingArguments {
                     context: "record".to_string(),
-                    usage: "record <start|stop|restart> [path] [url]",
+                    usage: "record <start|stop|restart> [path] [url] [flags]",
                 }),
             }
         }
@@ -2639,6 +2619,189 @@ fn parse_storage(rest: &[&str], id: &str) -> Result<Value, ParseError> {
             usage: "storage <local|session> [get|set|clear] [key] [value]",
         }),
     }
+}
+
+/// Parse the positional + flag arguments for `record start` and
+/// `record restart`. The first non-flag is the output path, the second is
+/// an optional URL. Recognised flags:
+///
+///   --auto-cursor / --no-auto-cursor   force-enable / force-disable cursor
+///   --robotic                          shorthand for legacy zero-pacing mode
+///   --type-delay <ms>                  per-keystroke delay
+///   --type-jitter <ms>                 jitter added on top of delay
+///   --mouse-duration <ms>              cursor animation duration
+///   --settle-ms <ms>                   pause after cursor lands, before action
+///   --fps <n>                          capture frame rate (1..=60)
+///   --log-actions <path>               write a JSONL action log alongside video
+///
+/// Defaults are natural-mode (visible cursor, human-paced typing, 30 FPS) so
+/// `record start <path>` produces a human-looking recording with no flags.
+fn parse_record_args(
+    id: &str,
+    action: &str,
+    usage: &'static str,
+    rest: &[&str],
+) -> Result<Value, ParseError> {
+    let mut positional: Vec<&str> = Vec::new();
+    let mut auto_cursor: Option<bool> = None;
+    let mut robotic = false;
+    let mut type_delay_ms: Option<u64> = None;
+    let mut type_jitter_ms: Option<u64> = None;
+    let mut mouse_duration_ms: Option<u64> = None;
+    let mut settle_ms: Option<u64> = None;
+    let mut fps: Option<u64> = None;
+    let mut log_actions_path: Option<String> = None;
+
+    let mut idx = 0;
+    while idx < rest.len() {
+        let arg = rest[idx];
+        match arg {
+            "--auto-cursor" => {
+                auto_cursor = Some(true);
+                idx += 1;
+            }
+            "--no-auto-cursor" => {
+                auto_cursor = Some(false);
+                idx += 1;
+            }
+            "--robotic" => {
+                robotic = true;
+                idx += 1;
+            }
+            "--type-delay" => {
+                idx += 1;
+                let v = rest.get(idx).ok_or_else(|| ParseError::MissingArguments {
+                    context: format!("{} --type-delay <ms>", action),
+                    usage,
+                })?;
+                type_delay_ms = Some(v.parse::<u64>().map_err(|_| ParseError::InvalidValue {
+                    message: format!("--type-delay must be a non-negative integer, got '{}'", v),
+                    usage,
+                })?);
+                idx += 1;
+            }
+            "--type-jitter" => {
+                idx += 1;
+                let v = rest.get(idx).ok_or_else(|| ParseError::MissingArguments {
+                    context: format!("{} --type-jitter <ms>", action),
+                    usage,
+                })?;
+                type_jitter_ms = Some(v.parse::<u64>().map_err(|_| ParseError::InvalidValue {
+                    message: format!("--type-jitter must be a non-negative integer, got '{}'", v),
+                    usage,
+                })?);
+                idx += 1;
+            }
+            "--mouse-duration" => {
+                idx += 1;
+                let v = rest.get(idx).ok_or_else(|| ParseError::MissingArguments {
+                    context: format!("{} --mouse-duration <ms>", action),
+                    usage,
+                })?;
+                mouse_duration_ms = Some(v.parse::<u64>().map_err(|_| ParseError::InvalidValue {
+                    message: format!(
+                        "--mouse-duration must be a non-negative integer, got '{}'",
+                        v
+                    ),
+                    usage,
+                })?);
+                idx += 1;
+            }
+            "--settle-ms" => {
+                idx += 1;
+                let v = rest.get(idx).ok_or_else(|| ParseError::MissingArguments {
+                    context: format!("{} --settle-ms <ms>", action),
+                    usage,
+                })?;
+                settle_ms = Some(v.parse::<u64>().map_err(|_| ParseError::InvalidValue {
+                    message: format!("--settle-ms must be a non-negative integer, got '{}'", v),
+                    usage,
+                })?);
+                idx += 1;
+            }
+            "--fps" => {
+                idx += 1;
+                let v = rest.get(idx).ok_or_else(|| ParseError::MissingArguments {
+                    context: format!("{} --fps <n>", action),
+                    usage,
+                })?;
+                let n = v.parse::<u64>().map_err(|_| ParseError::InvalidValue {
+                    message: format!("--fps must be a positive integer, got '{}'", v),
+                    usage,
+                })?;
+                if !(1..=60).contains(&n) {
+                    return Err(ParseError::InvalidValue {
+                        message: format!("--fps must be between 1 and 60, got {}", n),
+                        usage,
+                    });
+                }
+                fps = Some(n);
+                idx += 1;
+            }
+            "--log-actions" => {
+                idx += 1;
+                let v = rest.get(idx).ok_or_else(|| ParseError::MissingArguments {
+                    context: format!("{} --log-actions <path>", action),
+                    usage,
+                })?;
+                log_actions_path = Some(v.to_string());
+                idx += 1;
+            }
+            other if other.starts_with("--") => {
+                return Err(ParseError::InvalidValue {
+                    message: format!("unknown flag '{}' for `{}`", other, action),
+                    usage,
+                });
+            }
+            other => {
+                positional.push(other);
+                idx += 1;
+            }
+        }
+    }
+
+    let path = positional.first().ok_or_else(|| ParseError::MissingArguments {
+        context: action.to_string(),
+        usage,
+    })?;
+
+    let mut cmd = json!({ "id": id, "action": action, "path": path });
+
+    if let Some(u) = positional.get(1) {
+        let url_str = if u.starts_with("http") || u.contains("://") {
+            u.to_string()
+        } else {
+            format!("https://{}", u)
+        };
+        cmd["url"] = json!(url_str);
+    }
+
+    if robotic {
+        cmd["robotic"] = json!(true);
+    }
+    if let Some(b) = auto_cursor {
+        cmd["autoCursor"] = json!(b);
+    }
+    if let Some(d) = type_delay_ms {
+        cmd["typeDelayMs"] = json!(d);
+    }
+    if let Some(j) = type_jitter_ms {
+        cmd["typeJitterMs"] = json!(j);
+    }
+    if let Some(d) = mouse_duration_ms {
+        cmd["mouseDurationMs"] = json!(d);
+    }
+    if let Some(s) = settle_ms {
+        cmd["settleMs"] = json!(s);
+    }
+    if let Some(f) = fps {
+        cmd["fps"] = json!(f);
+    }
+    if let Some(p) = log_actions_path {
+        cmd["logActionsPath"] = json!(p);
+    }
+
+    Ok(cmd)
 }
 
 /// Split a string into arguments respecting shell quoting (double/single quotes, backslash escapes).
@@ -3949,6 +4112,130 @@ mod tests {
             result.unwrap_err(),
             ParseError::MissingArguments { .. }
         ));
+    }
+
+    // === Record natural-mode flag tests ===
+
+    #[test]
+    fn test_record_start_bare_does_not_inline_natural_flags() {
+        // Defaults are applied server-side (in DaemonState) so a bare
+        // `record start out.webm` produces the same minimal JSON as before.
+        let cmd = parse_command(&args("record start output.webm"), &default_flags()).unwrap();
+        assert_eq!(cmd["action"], "recording_start");
+        assert_eq!(cmd["path"], "output.webm");
+        assert!(cmd.get("autoCursor").is_none());
+        assert!(cmd.get("typeDelayMs").is_none());
+        assert!(cmd.get("fps").is_none());
+        assert!(cmd.get("robotic").is_none());
+    }
+
+    #[test]
+    fn test_record_start_robotic_flag_round_trips() {
+        let cmd =
+            parse_command(&args("record start out.webm --robotic"), &default_flags()).unwrap();
+        assert_eq!(cmd["action"], "recording_start");
+        assert_eq!(cmd["robotic"], true);
+    }
+
+    #[test]
+    fn test_record_start_individual_overrides() {
+        let cmd = parse_command(
+            &args(
+                "record start out.webm \
+                 --auto-cursor --type-delay 80 --type-jitter 30 \
+                 --mouse-duration 500 --settle-ms 250 --fps 24 \
+                 --log-actions /tmp/actions.jsonl",
+            ),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["autoCursor"], true);
+        assert_eq!(cmd["typeDelayMs"], 80);
+        assert_eq!(cmd["typeJitterMs"], 30);
+        assert_eq!(cmd["mouseDurationMs"], 500);
+        assert_eq!(cmd["settleMs"], 250);
+        assert_eq!(cmd["fps"], 24);
+        assert_eq!(cmd["logActionsPath"], "/tmp/actions.jsonl");
+    }
+
+    #[test]
+    fn test_record_start_no_auto_cursor() {
+        let cmd = parse_command(
+            &args("record start out.webm --no-auto-cursor"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["autoCursor"], false);
+    }
+
+    #[test]
+    fn test_record_start_url_after_flags() {
+        let cmd = parse_command(
+            &args("record start out.webm --fps 30 https://example.com"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["path"], "out.webm");
+        assert_eq!(cmd["url"], "https://example.com");
+        assert_eq!(cmd["fps"], 30);
+    }
+
+    #[test]
+    fn test_record_start_flags_before_path() {
+        // Flags don't have to come last -- the parser should still pull
+        // out the positional path.
+        let cmd = parse_command(
+            &args("record start --type-delay 50 out.webm"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["path"], "out.webm");
+        assert_eq!(cmd["typeDelayMs"], 50);
+    }
+
+    #[test]
+    fn test_record_start_invalid_fps_rejected() {
+        let result = parse_command(
+            &args("record start out.webm --fps 999"),
+            &default_flags(),
+        );
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ParseError::InvalidValue { .. }
+        ));
+    }
+
+    #[test]
+    fn test_record_start_unknown_flag_rejected() {
+        let result = parse_command(
+            &args("record start out.webm --bogus value"),
+            &default_flags(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_record_start_type_delay_missing_value() {
+        let result =
+            parse_command(&args("record start out.webm --type-delay"), &default_flags());
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ParseError::MissingArguments { .. }
+        ));
+    }
+
+    #[test]
+    fn test_record_restart_supports_natural_flags() {
+        let cmd = parse_command(
+            &args("record restart out.webm --type-delay 70 --log-actions /tmp/a.jsonl"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["action"], "recording_restart");
+        assert_eq!(cmd["typeDelayMs"], 70);
+        assert_eq!(cmd["logActionsPath"], "/tmp/a.jsonl");
     }
 
     // === Profile (CDP Tracing) Tests ===

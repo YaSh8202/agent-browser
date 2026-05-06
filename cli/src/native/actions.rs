@@ -6,6 +6,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::time::Instant;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::sync::{broadcast, oneshot, RwLock};
 
@@ -21,15 +22,16 @@ use super::cdp::types::{
     TargetCreatedEvent, TargetDestroyedEvent, TargetInfoChangedEvent,
 };
 use super::cookies;
+use super::cursor;
 use super::diff;
-use super::element::RefMap;
+use super::element::{self, RefMap};
 use super::inspect_server::InspectServer;
 use super::interaction;
 use super::network::{self, DomainFilter, EventTracker};
 use super::policy::{ActionPolicy, ConfirmActions, PolicyResult};
 use super::providers;
 use super::react;
-use super::recording::{self, RecordingState};
+use super::recording::{self, RecordingConfig, RecordingState};
 use super::screenshot::{self, ScreenshotOptions};
 use super::snapshot::{self, SnapshotOptions};
 use super::state;
@@ -563,10 +565,12 @@ impl DaemonState {
     ) -> Result<(), String> {
         let shared_count = Arc::new(AtomicU64::new(0));
         let (cancel_tx, cancel_rx) = oneshot::channel();
+        let fps = self.recording_state.config.fps;
         let handle = recording::spawn_recording_task(
             client,
             session_id,
             self.recording_state.output_path.clone(),
+            fps,
             shared_count.clone(),
             cancel_rx,
         );
@@ -2203,6 +2207,7 @@ async fn launch_safari(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
 }
 
 async fn handle_navigate(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    let started = Instant::now();
     let url = cmd
         .get("url")
         .and_then(|v| v.as_str())
@@ -2222,6 +2227,14 @@ async fn handle_navigate(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
             wb.navigate(url).await?;
             let new_url = wb.get_url().await.unwrap_or_else(|_| url.to_string());
             let title = wb.get_title().await.unwrap_or_default();
+            log_user_action(
+                state,
+                "navigate",
+                json!({ "url": new_url, "backend": "webdriver" }),
+                None,
+                started,
+                true,
+            );
             return Ok(json!({ "url": new_url, "title": title }));
         }
     }
@@ -2279,7 +2292,17 @@ async fn handle_navigate(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
     state.ref_map.clear();
     state.iframe_sessions.clear();
     state.active_frame_id = None;
-    mgr.navigate(url, wait_until).await
+    let result = mgr.navigate(url, wait_until).await;
+    let ok = result.is_ok();
+    log_user_action(
+        state,
+        "navigate",
+        json!({ "url": url }),
+        None,
+        started,
+        ok,
+    );
+    result
 }
 
 async fn handle_url(state: &DaemonState) -> Result<Value, String> {
@@ -2609,6 +2632,7 @@ async fn handle_screenshot(cmd: &Value, state: &mut DaemonState) -> Result<Value
 }
 
 async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    let started = Instant::now();
     let selector = cmd
         .get("selector")
         .and_then(|v| v.as_str())
@@ -2617,16 +2641,28 @@ async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
     if let Some(ref wb) = state.webdriver_backend {
         if state.browser.is_none() {
             wb.click(selector).await?;
+            log_user_action(
+                state,
+                "click",
+                json!({ "selector": selector, "backend": "webdriver" }),
+                None,
+                started,
+                true,
+            );
             return Ok(json!({ "clicked": selector }));
         }
     }
 
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
+    let session_id = {
+        let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+        mgr.active_session_id()?.to_string()
+    };
 
     let new_tab = cmd.get("newTab").and_then(|v| v.as_bool()).unwrap_or(false);
 
     if new_tab {
+        let cursor_target = animate_cursor_for_selector(state, &session_id, selector).await;
+        let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
         use super::element::resolve_element_object_id;
         let (object_id, effective_session_id) = resolve_element_object_id(
             &mgr.client,
@@ -2665,12 +2701,23 @@ async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
         state.ref_map.clear();
         mgr.tab_new(Some(&href), None).await?;
 
+        log_user_action(
+            state,
+            "click",
+            json!({ "selector": selector, "newTab": true, "url": href }),
+            cursor_target,
+            started,
+            true,
+        );
         return Ok(json!({ "clicked": selector, "newTab": true, "url": href }));
     }
+
+    let cursor_target = animate_cursor_for_selector(state, &session_id, selector).await;
 
     let button = cmd.get("button").and_then(|v| v.as_str()).unwrap_or("left");
     let click_count = cmd.get("clickCount").and_then(|v| v.as_i64()).unwrap_or(1) as i32;
 
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     interaction::click(
         &mgr.client,
         &session_id,
@@ -2682,17 +2729,31 @@ async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
     )
     .await?;
 
+    log_user_action(
+        state,
+        "click",
+        json!({ "selector": selector, "button": button, "clickCount": click_count }),
+        cursor_target,
+        started,
+        true,
+    );
     Ok(json!({ "clicked": selector }))
 }
 
 async fn handle_dblclick(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
+    let started = Instant::now();
+    let session_id = {
+        let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+        mgr.active_session_id()?.to_string()
+    };
     let selector = cmd
         .get("selector")
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
 
+    let cursor_target = animate_cursor_for_selector(state, &session_id, selector).await;
+
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     interaction::dblclick(
         &mgr.client,
         &session_id,
@@ -2701,10 +2762,19 @@ async fn handle_dblclick(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         &state.iframe_sessions,
     )
     .await?;
+    log_user_action(
+        state,
+        "dblclick",
+        json!({ "selector": selector }),
+        cursor_target,
+        started,
+        true,
+    );
     Ok(json!({ "clicked": selector }))
 }
 
 async fn handle_fill(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    let started = Instant::now();
     let selector = cmd
         .get("selector")
         .and_then(|v| v.as_str())
@@ -2717,28 +2787,63 @@ async fn handle_fill(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
     if let Some(ref wb) = state.webdriver_backend {
         if state.browser.is_none() {
             wb.fill(selector, value).await?;
+            log_user_action(
+                state,
+                "fill",
+                json!({ "selector": selector, "value": value, "backend": "webdriver" }),
+                None,
+                started,
+                true,
+            );
             return Ok(json!({ "filled": selector }));
         }
     }
 
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
+    let session_id = {
+        let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+        mgr.active_session_id()?.to_string()
+    };
 
-    interaction::fill(
+    let cursor_target = animate_cursor_for_selector(state, &session_id, selector).await;
+
+    // While recording, switch to the human-paced per-keystroke path so the
+    // viewer sees individual letters appear instead of an instant burst.
+    let (delay_ms, jitter_ms) = if state.recording_state.active {
+        let cur = state.recording_state.config.cursor;
+        (Some(cur.type_delay_ms), Some(cur.type_jitter_ms))
+    } else {
+        (None, None)
+    };
+
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    interaction::fill_with_options(
         &mgr.client,
         &session_id,
         &state.ref_map,
         selector,
         value,
+        delay_ms,
+        jitter_ms,
         &state.iframe_sessions,
     )
     .await?;
+    log_user_action(
+        state,
+        "fill",
+        json!({ "selector": selector, "value": value }),
+        cursor_target,
+        started,
+        true,
+    );
     Ok(json!({ "filled": selector }))
 }
 
 async fn handle_type(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
+    let started = Instant::now();
+    let session_id = {
+        let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+        mgr.active_session_id()?.to_string()
+    };
     let selector = cmd
         .get("selector")
         .and_then(|v| v.as_str())
@@ -2748,9 +2853,22 @@ async fn handle_type(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
         .and_then(|v| v.as_str())
         .ok_or("Missing 'text' parameter")?;
     let clear = cmd.get("clear").and_then(|v| v.as_bool()).unwrap_or(false);
-    let delay = cmd.get("delay").and_then(|v| v.as_u64());
 
-    interaction::type_text(
+    // Per-call `delay` overrides the recording config; otherwise inherit
+    // the recording's natural-mode pacing so videos look human.
+    let (delay, jitter) = match cmd.get("delay").and_then(|v| v.as_u64()) {
+        Some(d) => (Some(d), None),
+        None if state.recording_state.active => {
+            let cur = state.recording_state.config.cursor;
+            (Some(cur.type_delay_ms), Some(cur.type_jitter_ms))
+        }
+        None => (None, None),
+    };
+
+    let cursor_target = animate_cursor_for_selector(state, &session_id, selector).await;
+
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    interaction::type_text_with_jitter(
         &mgr.client,
         &session_id,
         &state.ref_map,
@@ -2758,13 +2876,23 @@ async fn handle_type(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
         text,
         clear,
         delay,
+        jitter,
         &state.iframe_sessions,
     )
     .await?;
+    log_user_action(
+        state,
+        "type",
+        json!({ "selector": selector, "text": text, "clear": clear }),
+        cursor_target,
+        started,
+        true,
+    );
     Ok(json!({ "typed": text }))
 }
 
 async fn handle_press(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    let started = Instant::now();
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let key = cmd
@@ -2776,6 +2904,14 @@ async fn handle_press(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
     let (actual_key, modifiers) = parse_key_chord(key);
 
     interaction::press_key_with_modifiers(&mgr.client, &session_id, &actual_key, modifiers).await?;
+    log_user_action(
+        state,
+        "press",
+        json!({ "key": key }),
+        None,
+        started,
+        true,
+    );
     Ok(json!({ "pressed": key }))
 }
 
@@ -2820,13 +2956,19 @@ fn parse_key_chord(input: &str) -> (String, Option<i32>) {
 }
 
 async fn handle_hover(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
+    let started = Instant::now();
+    let session_id = {
+        let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+        mgr.active_session_id()?.to_string()
+    };
     let selector = cmd
         .get("selector")
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
 
+    let cursor_target = animate_cursor_for_selector(state, &session_id, selector).await;
+
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     interaction::hover(
         &mgr.client,
         &session_id,
@@ -2835,13 +2977,27 @@ async fn handle_hover(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
         &state.iframe_sessions,
     )
     .await?;
+    log_user_action(
+        state,
+        "hover",
+        json!({ "selector": selector }),
+        cursor_target,
+        started,
+        true,
+    );
     Ok(json!({ "hovered": selector }))
 }
 
 async fn handle_scroll(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
-    let selector = cmd.get("selector").and_then(|v| v.as_str());
+    let started = Instant::now();
+    let session_id = {
+        let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+        mgr.active_session_id()?.to_string()
+    };
+    let selector_owned = cmd
+        .get("selector")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
 
     let (mut dx, mut dy) = (
         cmd.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0),
@@ -2859,22 +3015,42 @@ async fn handle_scroll(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         }
     }
 
+    // If a selector is provided, animate the cursor to that container so
+    // the viewer sees what's about to scroll.
+    let cursor_target = if let Some(s) = selector_owned.as_deref() {
+        animate_cursor_for_selector(state, &session_id, s).await
+    } else {
+        None
+    };
+
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     interaction::scroll(
         &mgr.client,
         &session_id,
         &state.ref_map,
-        selector,
+        selector_owned.as_deref(),
         dx,
         dy,
         &state.iframe_sessions,
     )
     .await?;
+    log_user_action(
+        state,
+        "scroll",
+        json!({ "selector": selector_owned, "x": dx, "y": dy }),
+        cursor_target,
+        started,
+        true,
+    );
     Ok(json!({ "scrolled": true }))
 }
 
 async fn handle_select(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
+    let started = Instant::now();
+    let session_id = {
+        let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+        mgr.active_session_id()?.to_string()
+    };
     let selector = cmd
         .get("selector")
         .and_then(|v| v.as_str())
@@ -2893,6 +3069,9 @@ async fn handle_select(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
             .unwrap_or_default(),
     };
 
+    let cursor_target = animate_cursor_for_selector(state, &session_id, selector).await;
+
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     interaction::select_option(
         &mgr.client,
         &session_id,
@@ -2902,17 +3081,31 @@ async fn handle_select(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         &state.iframe_sessions,
     )
     .await?;
+    log_user_action(
+        state,
+        "select",
+        json!({ "selector": selector, "values": values }),
+        cursor_target,
+        started,
+        true,
+    );
     Ok(json!({ "selected": values }))
 }
 
 async fn handle_check(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
+    let started = Instant::now();
+    let session_id = {
+        let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+        mgr.active_session_id()?.to_string()
+    };
     let selector = cmd
         .get("selector")
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
 
+    let cursor_target = animate_cursor_for_selector(state, &session_id, selector).await;
+
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     interaction::check(
         &mgr.client,
         &session_id,
@@ -2921,17 +3114,31 @@ async fn handle_check(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
         &state.iframe_sessions,
     )
     .await?;
+    log_user_action(
+        state,
+        "check",
+        json!({ "selector": selector }),
+        cursor_target,
+        started,
+        true,
+    );
     Ok(json!({ "checked": selector }))
 }
 
 async fn handle_uncheck(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
+    let started = Instant::now();
+    let session_id = {
+        let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+        mgr.active_session_id()?.to_string()
+    };
     let selector = cmd
         .get("selector")
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
 
+    let cursor_target = animate_cursor_for_selector(state, &session_id, selector).await;
+
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     interaction::uncheck(
         &mgr.client,
         &session_id,
@@ -2940,6 +3147,14 @@ async fn handle_uncheck(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
         &state.iframe_sessions,
     )
     .await?;
+    log_user_action(
+        state,
+        "uncheck",
+        json!({ "selector": selector }),
+        cursor_target,
+        started,
+        true,
+    );
     Ok(json!({ "unchecked": selector }))
 }
 
@@ -3652,8 +3867,22 @@ async fn handle_keyboard(cmd: &Value, state: &DaemonState) -> Result<Value, Stri
                 .get("text")
                 .and_then(|v| v.as_str())
                 .ok_or("Missing 'text' parameter")?;
-            interaction::type_text_into_active_context(&mgr.client, &session_id, text, None)
-                .await?;
+            // While recording, inherit the natural-mode pacing so videos
+            // show keystrokes appearing one at a time.
+            let (delay, jitter) = if state.recording_state.active {
+                let cur = state.recording_state.config.cursor;
+                (cur.type_delay_ms, cur.type_jitter_ms)
+            } else {
+                (0, 0)
+            };
+            interaction::type_text_into_active_context_jittered(
+                &mgr.client,
+                &session_id,
+                text,
+                delay,
+                jitter,
+            )
+            .await?;
             return Ok(json!({ "typed": text }));
         }
         Some("insertText") => {
@@ -4026,6 +4255,112 @@ async fn handle_profiler_stop(cmd: &Value, state: &mut DaemonState) -> Result<Va
     native_tracing::profiler_stop(&mgr.client, &session_id, &mut state.tracing_state, path).await
 }
 
+/// Build a [`RecordingConfig`] from the flag-derived JSON fields the CLI
+/// parser folds into the `recording_start` / `recording_restart` cmd.
+fn parse_recording_config(cmd: &Value) -> RecordingConfig {
+    let robotic = cmd.get("robotic").and_then(|v| v.as_bool()).unwrap_or(false);
+    let mut cfg = if robotic {
+        RecordingConfig::robotic()
+    } else {
+        RecordingConfig::natural()
+    };
+
+    if let Some(b) = cmd.get("autoCursor").and_then(|v| v.as_bool()) {
+        cfg.cursor.auto_cursor = b;
+    }
+    if let Some(d) = cmd.get("typeDelayMs").and_then(|v| v.as_u64()) {
+        cfg.cursor.type_delay_ms = d;
+    }
+    if let Some(j) = cmd.get("typeJitterMs").and_then(|v| v.as_u64()) {
+        cfg.cursor.type_jitter_ms = j;
+    }
+    if let Some(d) = cmd.get("mouseDurationMs").and_then(|v| v.as_u64()) {
+        cfg.cursor.mouse_duration_ms = d;
+    }
+    if let Some(s) = cmd.get("settleMs").and_then(|v| v.as_u64()) {
+        cfg.cursor.settle_ms = s;
+    }
+    if let Some(f) = cmd.get("fps").and_then(|v| v.as_u64()) {
+        cfg.fps = f.clamp(1, 60) as u32;
+    }
+    if let Some(p) = cmd.get("logActionsPath").and_then(|v| v.as_str()) {
+        if !p.is_empty() {
+            cfg.log_actions_path = Some(p.to_string());
+        }
+    }
+
+    cfg
+}
+
+/// Resolve `selector` to viewport coordinates, then animate the visible
+/// cursor overlay to that point. No-op when no recording is active.
+/// Returns the resolved (x, y) on success so action handlers can include
+/// them in the JSONL action log.
+async fn animate_cursor_for_selector(
+    state: &mut DaemonState,
+    session_id: &str,
+    selector: &str,
+) -> Option<(f64, f64)> {
+    if !state.recording_state.active {
+        return None;
+    }
+    let cfg = state.recording_state.config.cursor;
+    let client = state.browser.as_ref()?.client.clone();
+
+    let resolved = element::resolve_element_center(
+        &client,
+        session_id,
+        &state.ref_map,
+        selector,
+        &state.iframe_sessions,
+    )
+    .await
+    .ok()?;
+    let (x, y, eff_session) = resolved;
+
+    if cfg.auto_cursor {
+        let _ = cursor::animate_to(
+            &client,
+            &eff_session,
+            &mut state.recording_state.cursor,
+            x,
+            y,
+            &cfg,
+        )
+        .await;
+    } else {
+        state.recording_state.cursor.x = x;
+        state.recording_state.cursor.y = y;
+    }
+    Some((x, y))
+}
+
+/// Append a JSONL entry to the recording's action log. Cheap and safe to
+/// call unconditionally -- it bails immediately if no log is configured.
+fn log_user_action(
+    state: &DaemonState,
+    name: &str,
+    args: Value,
+    target: Option<(f64, f64)>,
+    started: Instant,
+    ok: bool,
+) {
+    if state.recording_state.action_log.is_none() {
+        return;
+    }
+    let duration_ms = started.elapsed().as_millis() as u64;
+    let mut entry = json!({
+        "action": name,
+        "args": args,
+        "durationMs": duration_ms,
+        "ok": ok,
+    });
+    if let Some((x, y)) = target {
+        entry["target"] = json!({ "x": x as i64, "y": y as i64 });
+    }
+    recording::append_action_log(&state.recording_state, entry);
+}
+
 async fn handle_recording_start(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
     let path = cmd
         .get("path")
@@ -4036,6 +4371,14 @@ async fn handle_recording_start(cmd: &Value, state: &mut DaemonState) -> Result<
         .get("url")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty());
+
+    let recording_config = parse_recording_config(cmd);
+    // Open the action log synchronously before spawning the capture task so
+    // a bad path fails fast instead of silently dropping events later.
+    let action_log = match recording_config.log_actions_path.as_ref() {
+        Some(p) => Some(recording::open_action_log(p)?),
+        None => None,
+    };
 
     let viewport = state.viewport;
 
@@ -4175,8 +4518,21 @@ async fn handle_recording_start(cmd: &Value, state: &mut DaemonState) -> Result<
         (mgr.client.clone(), new_session_id)
     };
 
-    let result = recording::recording_start(&mut state.recording_state, path)?;
-    state.start_recording_task(client, new_session_id).await?;
+    let result = recording::recording_start_with_config(
+        &mut state.recording_state,
+        path,
+        recording_config,
+    )?;
+    state.recording_state.action_log = action_log;
+    state
+        .start_recording_task(client.clone(), new_session_id.clone())
+        .await?;
+
+    // Inject the cursor overlay so it survives navigations and is also
+    // painted on the page that's already loaded.
+    if state.recording_state.config.cursor.auto_cursor {
+        let _ = cursor::install(&client, &new_session_id).await;
+    }
 
     if let Some(ref server) = state.stream_server {
         server.set_recording(true, &state.engine).await;
@@ -4202,14 +4558,43 @@ async fn handle_recording_restart(cmd: &Value, state: &mut DaemonState) -> Resul
         .and_then(|v| v.as_str())
         .ok_or("Missing 'path' parameter")?;
 
+    // If the user re-passed flags on `record restart`, honour them. Otherwise
+    // fall back to the previous recording's config (preserve, not reset).
+    let new_config = if cmd.get("autoCursor").is_some()
+        || cmd.get("robotic").is_some()
+        || cmd.get("typeDelayMs").is_some()
+        || cmd.get("typeJitterMs").is_some()
+        || cmd.get("mouseDurationMs").is_some()
+        || cmd.get("settleMs").is_some()
+        || cmd.get("fps").is_some()
+        || cmd.get("logActionsPath").is_some()
+    {
+        parse_recording_config(cmd)
+    } else {
+        state.recording_state.config.clone()
+    };
+    let action_log = match new_config.log_actions_path.as_ref() {
+        Some(p) => Some(recording::open_action_log(p)?),
+        None => None,
+    };
+
     let _ = state.stop_recording_task().await;
-    let result = recording::recording_restart(&mut state.recording_state, path)?;
+    let result = recording::recording_restart_with_config(
+        &mut state.recording_state,
+        path,
+        new_config,
+    )?;
+    state.recording_state.action_log = action_log;
 
     if let Some(ref browser) = state.browser {
         let session_id = browser.active_session_id()?.to_string();
+        let client = browser.client.clone();
         state
-            .start_recording_task(browser.client.clone(), session_id)
+            .start_recording_task(client.clone(), session_id.clone())
             .await?;
+        if state.recording_state.config.cursor.auto_cursor {
+            let _ = cursor::install(&client, &session_id).await;
+        }
     }
 
     Ok(result)
@@ -5607,15 +5992,28 @@ async fn execute_subaction(
     state: &mut DaemonState,
     selector: &str,
 ) -> Result<Value, String> {
+    let started = Instant::now();
     let subaction = cmd
         .get("subaction")
         .and_then(|v| v.as_str())
         .unwrap_or("click");
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
+    let session_id = {
+        let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+        mgr.active_session_id()?.to_string()
+    };
+
+    // For semantic locators, the daemon has just marked the element with a
+    // sentinel attribute -- so the same `selector` string used to dispatch
+    // the action is also a valid CSS selector for the cursor to resolve.
+    let cursor_target = if matches!(subaction, "click" | "fill" | "check" | "hover") {
+        animate_cursor_for_selector(state, &session_id, selector).await
+    } else {
+        None
+    };
 
     match subaction {
         "click" => {
+            let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
             interaction::click(
                 &mgr.client,
                 &session_id,
@@ -5626,6 +6024,14 @@ async fn execute_subaction(
                 &state.iframe_sessions,
             )
             .await?;
+            log_user_action(
+                state,
+                "click",
+                json!({ "selector": selector, "via": "find" }),
+                cursor_target,
+                started,
+                true,
+            );
             Ok(json!({ "clicked": selector }))
         }
         "fill" => {
@@ -5633,18 +6039,40 @@ async fn execute_subaction(
                 .get("value")
                 .and_then(|v| v.as_str())
                 .ok_or("Missing 'value' for fill subaction")?;
-            interaction::fill(
+            // While recording, the natural-mode typing pacing applies to
+            // semantic-locator fills too -- it would feel odd if `fill`
+            // through `find` kept the bulk-insert burst while plain `fill`
+            // typed letter-by-letter.
+            let (delay_ms, jitter_ms) = if state.recording_state.active {
+                let cur = state.recording_state.config.cursor;
+                (Some(cur.type_delay_ms), Some(cur.type_jitter_ms))
+            } else {
+                (None, None)
+            };
+            let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+            interaction::fill_with_options(
                 &mgr.client,
                 &session_id,
                 &state.ref_map,
                 selector,
                 value,
+                delay_ms,
+                jitter_ms,
                 &state.iframe_sessions,
             )
             .await?;
+            log_user_action(
+                state,
+                "fill",
+                json!({ "selector": selector, "value": value, "via": "find" }),
+                cursor_target,
+                started,
+                true,
+            );
             Ok(json!({ "filled": selector }))
         }
         "check" => {
+            let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
             interaction::check(
                 &mgr.client,
                 &session_id,
@@ -5653,9 +6081,18 @@ async fn execute_subaction(
                 &state.iframe_sessions,
             )
             .await?;
+            log_user_action(
+                state,
+                "check",
+                json!({ "selector": selector, "via": "find" }),
+                cursor_target,
+                started,
+                true,
+            );
             Ok(json!({ "checked": selector }))
         }
         "hover" => {
+            let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
             interaction::hover(
                 &mgr.client,
                 &session_id,
@@ -5664,9 +6101,18 @@ async fn execute_subaction(
                 &state.iframe_sessions,
             )
             .await?;
+            log_user_action(
+                state,
+                "hover",
+                json!({ "selector": selector, "via": "find" }),
+                cursor_target,
+                started,
+                true,
+            );
             Ok(json!({ "hovered": selector }))
         }
         "text" => {
+            let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
             let text = super::element::get_element_text(
                 &mgr.client,
                 &session_id,

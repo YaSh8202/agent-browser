@@ -4,6 +4,7 @@ use serde_json::Value;
 
 use super::cdp::client::CdpClient;
 use super::cdp::types::*;
+use super::cursor::jittered_delay_ms;
 use super::element::{resolve_element_center, resolve_element_object_id, RefMap};
 
 pub async fn click(
@@ -88,6 +89,33 @@ pub async fn fill(
     value: &str,
     iframe_sessions: &HashMap<String, String>,
 ) -> Result<(), String> {
+    fill_with_options(
+        client,
+        session_id,
+        ref_map,
+        selector_or_ref,
+        value,
+        None,
+        None,
+        iframe_sessions,
+    )
+    .await
+}
+
+/// Like [`fill`], but emits text per-character with optional jittered delay
+/// between keystrokes. When `delay_ms` is `None` or `0`, falls through to
+/// the legacy bulk `Input.insertText` fast path.
+#[allow(clippy::too_many_arguments)]
+pub async fn fill_with_options(
+    client: &CdpClient,
+    session_id: &str,
+    ref_map: &RefMap,
+    selector_or_ref: &str,
+    value: &str,
+    delay_ms: Option<u64>,
+    jitter_ms: Option<u64>,
+    iframe_sessions: &HashMap<String, String>,
+) -> Result<(), String> {
     let (object_id, effective_session_id) = resolve_element_object_id(
         client,
         session_id,
@@ -132,16 +160,24 @@ pub async fn fill(
         )
         .await?;
 
-    // Insert text (keyboard input dispatched at page level, use parent session_id)
-    client
-        .send_command_typed::<_, Value>(
-            "Input.insertText",
-            &InsertTextParams {
-                text: value.to_string(),
-            },
-            Some(session_id),
-        )
-        .await?;
+    let delay = delay_ms.unwrap_or(0);
+    let jitter = jitter_ms.unwrap_or(0);
+
+    if delay == 0 {
+        // Fast path: single CDP round-trip with no per-keystroke pacing.
+        client
+            .send_command_typed::<_, Value>(
+                "Input.insertText",
+                &InsertTextParams {
+                    text: value.to_string(),
+                },
+                Some(session_id),
+            )
+            .await?;
+    } else {
+        // Human-paced: emit one character at a time with jittered delays.
+        insert_text_chunked(client, session_id, value, delay, jitter).await?;
+    }
 
     Ok(())
 }
@@ -155,6 +191,34 @@ pub async fn type_text(
     text: &str,
     clear: bool,
     delay_ms: Option<u64>,
+    iframe_sessions: &HashMap<String, String>,
+) -> Result<(), String> {
+    type_text_with_jitter(
+        client,
+        session_id,
+        ref_map,
+        selector_or_ref,
+        text,
+        clear,
+        delay_ms,
+        None,
+        iframe_sessions,
+    )
+    .await
+}
+
+/// Like [`type_text`], but with optional jittered per-keystroke delay so the
+/// recorded video doesn't look like a single insertText burst.
+#[allow(clippy::too_many_arguments)]
+pub async fn type_text_with_jitter(
+    client: &CdpClient,
+    session_id: &str,
+    ref_map: &RefMap,
+    selector_or_ref: &str,
+    text: &str,
+    clear: bool,
+    delay_ms: Option<u64>,
+    jitter_ms: Option<u64>,
     iframe_sessions: &HashMap<String, String>,
 ) -> Result<(), String> {
     let (object_id, effective_session_id) = resolve_element_object_id(
@@ -202,7 +266,14 @@ pub async fn type_text(
             .await?;
     }
 
-    type_text_into_active_context(client, session_id, text, delay_ms).await
+    insert_text_chunked(
+        client,
+        session_id,
+        text,
+        delay_ms.unwrap_or(0),
+        jitter_ms.unwrap_or(0),
+    )
+    .await
 }
 
 pub async fn type_text_into_active_context(
@@ -211,8 +282,35 @@ pub async fn type_text_into_active_context(
     text: &str,
     delay_ms: Option<u64>,
 ) -> Result<(), String> {
-    let delay = delay_ms.unwrap_or(0);
+    insert_text_chunked(client, session_id, text, delay_ms.unwrap_or(0), 0).await
+}
 
+/// Like [`type_text_into_active_context`], but with optional jittered delay
+/// between keystrokes for human-feeling pacing.
+pub async fn type_text_into_active_context_jittered(
+    client: &CdpClient,
+    session_id: &str,
+    text: &str,
+    delay_ms: u64,
+    jitter_ms: u64,
+) -> Result<(), String> {
+    insert_text_chunked(client, session_id, text, delay_ms, jitter_ms).await
+}
+
+/// Char-by-char text insertion via CDP. Printable characters go through
+/// `Input.insertText` (Electron-safe); `\n`, `\r`, `\t` go through
+/// `Input.dispatchKeyEvent` so editors / forms see real key events.
+///
+/// When `delay_ms == 0` and `jitter_ms == 0`, no sleep is emitted between
+/// characters -- this still produces a per-char CDP burst rather than a
+/// single bulk insert, which is what callers like `keyboard type` rely on.
+pub async fn insert_text_chunked(
+    client: &CdpClient,
+    session_id: &str,
+    text: &str,
+    delay_ms: u64,
+    jitter_ms: u64,
+) -> Result<(), String> {
     for ch in text.chars() {
         if matches!(ch, '\n' | '\r' | '\t') {
             let (key, code, key_code) = char_to_key_info(ch);
@@ -265,8 +363,9 @@ pub async fn type_text_into_active_context(
                 .await?;
         }
 
-        if delay > 0 {
-            tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
+        if delay_ms > 0 {
+            let pause = jittered_delay_ms(delay_ms, jitter_ms);
+            tokio::time::sleep(tokio::time::Duration::from_millis(pause)).await;
         }
     }
 

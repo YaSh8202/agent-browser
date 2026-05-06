@@ -1,5 +1,13 @@
 # agent-browser
 
+## Unreleased
+
+### New Features
+
+- **Natural-looking demo recordings** — `record start` now produces human-paced video by default. A visible cursor overlay is injected into the page and animates smoothly to each click/hover/fill target before the action fires; `type` and `fill` emit one keystroke at a time with a jittered delay so text appears the way a person would type it; capture rate is 30 FPS so animations are smooth. New flags expose every knob individually: `--auto-cursor` / `--no-auto-cursor`, `--type-delay <ms>`, `--type-jitter <ms>`, `--mouse-duration <ms>`, `--settle-ms <ms>`, `--fps <n>`, `--log-actions <path>`. The legacy zero-pacing behaviour is still available via `--robotic`. (See README "Recording (demo videos)" for the full reference.)
+- **Action timing JSONL sidecar** — `record start ... --log-actions <path>` writes one JSON entry per user-visible action (click, hover, fill, type, scroll, …) with the action name, args, target coordinates, frame index, ms-since-record-start, and ok/err. Designed for downstream voiceover script generation that needs to align audio with the recorded timeline.
+- **BC note**: `record start` defaults flipped from instant/no-cursor to natural pacing. Pass `--robotic` to opt back into the previous behaviour.
+
 ## 0.26.0
 
 <!-- release:start -->
