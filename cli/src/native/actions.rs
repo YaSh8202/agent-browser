@@ -3424,17 +3424,103 @@ async fn wait_for_selector(
     poll_until_true(client, session_id, &check_fn, timeout_ms).await
 }
 
+/// Match a URL pattern against an actual URL. Supports:
+/// - `**/X` → contains "/X" anywhere
+/// - `*.ext` → ends with ".ext"
+/// - bare string → contains substring
+fn url_matches(pattern: &str, url: &str) -> bool {
+    if let Some(suffix) = pattern.strip_prefix("**/") {
+        url.contains(&format!("/{}", suffix)) || url.ends_with(suffix)
+    } else if let Some(ext) = pattern.strip_prefix("*.") {
+        url.ends_with(&format!(".{}", ext))
+    } else if let Some(suffix) = pattern.strip_prefix('*') {
+        url.ends_with(suffix)
+    } else {
+        url.contains(pattern)
+    }
+}
+
+/// Wait for a navigation matching `pattern`. Subscribes to `Page.frameNavigated`
+/// events for fast path, with a 500ms poll backstop so we still complete even
+/// if events lag/miss. The poll-cadence is intentionally slow to avoid
+/// contending with concurrent recording traffic on the shared CDP connection.
 async fn wait_for_url(
     client: &super::cdp::client::CdpClient,
     session_id: &str,
     pattern: &str,
     timeout_ms: u64,
 ) -> Result<(), String> {
-    let check_fn = format!(
-        "location.href.includes({})",
-        serde_json::to_string(pattern).unwrap_or_default()
-    );
-    poll_until_true(client, session_id, &check_fn, timeout_ms).await
+    // Subscribe BEFORE the initial URL check to avoid a race where the page
+    // navigates between the check and the subscribe.
+    let mut event_rx = client.subscribe();
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout_ms);
+
+    if let Some(url) = poll_current_url(client, session_id).await {
+        if url_matches(pattern, &url) {
+            return Ok(());
+        }
+    }
+
+    let mut poll_tick = tokio::time::interval(tokio::time::Duration::from_millis(500));
+    poll_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    poll_tick.tick().await; // consume immediate first tick
+
+    loop {
+        let remaining = match deadline.checked_duration_since(tokio::time::Instant::now()) {
+            Some(d) if !d.is_zero() => d,
+            _ => return Err(format!("Wait timed out after {}ms", timeout_ms)),
+        };
+
+        tokio::select! {
+            biased;
+            ev = tokio::time::timeout(remaining, event_rx.recv()) => {
+                match ev {
+                    Ok(Ok(event)) => {
+                        if event.method != "Page.frameNavigated" { continue; }
+                        // session_id may differ across page navigations; don't filter.
+                        let frame = event.params.get("frame");
+                        if frame.and_then(|f| f.get("parentId")).and_then(|p| p.as_str()).is_some() {
+                            continue; // subframe
+                        }
+                        if let Some(url) = frame.and_then(|f| f.get("url")).and_then(|u| u.as_str()) {
+                            if url_matches(pattern, url) { return Ok(()); }
+                        }
+                    }
+                    Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                    Ok(Err(broadcast::error::RecvError::Closed)) => {
+                        // Fall through to poll path.
+                    }
+                    Err(_) => return Err(format!("Wait timed out after {}ms", timeout_ms)),
+                }
+            }
+            _ = poll_tick.tick() => {
+                if let Some(url) = poll_current_url(client, session_id).await {
+                    if url_matches(pattern, &url) { return Ok(()); }
+                }
+            }
+        }
+    }
+}
+
+/// Read `location.href` once. Returns `None` on any error so callers can
+/// keep waiting on events.
+async fn poll_current_url(
+    client: &super::cdp::client::CdpClient,
+    session_id: &str,
+) -> Option<String> {
+    client
+        .send_command_typed::<_, super::cdp::types::EvaluateResult>(
+            "Runtime.evaluate",
+            &super::cdp::types::EvaluateParams {
+                expression: "location.href".to_string(),
+                return_by_value: Some(true),
+                await_promise: Some(false),
+            },
+            Some(session_id),
+        )
+        .await
+        .ok()
+        .and_then(|r| r.result.value.and_then(|v| v.as_str().map(String::from)))
 }
 
 async fn wait_for_text(
@@ -3495,7 +3581,10 @@ async fn poll_until_true(
             return Err(format!("Wait timed out after {}ms", timeout_ms));
         }
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        // 250ms cadence keeps CDP traffic light during recordings (which poll
+        // Page.captureScreenshot at 100ms). 100ms here doubled the load with no
+        // perceptible benefit.
+        tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
     }
 }
 
@@ -6146,6 +6235,14 @@ async fn handle_getbyrole(cmd: &Value, state: &mut DaemonState) -> Result<Value,
         .ok_or("Missing 'role' parameter")?;
     let name = cmd.get("name").and_then(|v| v.as_str());
     let exact = cmd.get("exact").and_then(|v| v.as_bool()).unwrap_or(false);
+    let allow_ambiguous = cmd
+        .get("allowAmbiguous")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let include_hidden = cmd
+        .get("includeHidden")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let name_match = name
         .map(|n| {
@@ -6166,17 +6263,29 @@ async fn handle_getbyrole(cmd: &Value, state: &mut DaemonState) -> Result<Value,
 
     let js = format!(
         r#"(() => {{
-            const els = document.querySelectorAll('[role="{role}"], {role}');
-            for (const el of els) {{
-                if ({name_match}) {{
-                    el.setAttribute('data-agent-browser-located', 'true');
-                    return true;
-                }}
+            {visibility_helper}
+            const els = Array.from(document.querySelectorAll('[role="{role}"], {role}'));
+            const rawMatches = els.filter(el => {name_match});
+            const candidates = {include_hidden} ? rawMatches : rawMatches.filter(isInteractable);
+            const hiddenCount = rawMatches.length - candidates.length;
+            const matches = candidates.slice(0, 5).map(el => ({{
+                tag: el.tagName.toLowerCase(),
+                role: el.getAttribute('role') || '{role}',
+                name: (el.getAttribute('aria-label') || el.textContent || '').trim().slice(0, 60),
+                html: el.outerHTML.slice(0, 200),
+                interactive: true,
+                visible: isInteractable(el),
+            }}));
+            if (candidates.length === 1 || (candidates.length > 0 && {allow_ambiguous})) {{
+                candidates[0].setAttribute('data-agent-browser-located', 'true');
             }}
-            return false;
+            return {{ count: candidates.length, hiddenCount, matches }};
         }})()"#,
+        visibility_helper = VISIBILITY_HELPER_JS,
         role = role,
         name_match = name_match,
+        allow_ambiguous = allow_ambiguous,
+        include_hidden = include_hidden,
     );
 
     let result: super::cdp::types::EvaluateResult = mgr
@@ -6192,15 +6301,50 @@ async fn handle_getbyrole(cmd: &Value, state: &mut DaemonState) -> Result<Value,
         )
         .await?;
 
-    if !result
+    let raw = result
         .result
         .value
-        .as_ref()
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
+        .ok_or_else(|| "find role: empty CDP evaluation result".to_string())?;
+    let parsed: LocateResult = serde_json::from_value(raw)
+        .map_err(|e| format!("find role: invalid CDP evaluation result: {}", e))?;
+
+    if parsed.count == 0 {
         let desc = build_role_selector(role, name, exact);
+        if parsed.hidden_count > 0 {
+            return Err(format!(
+                "No visible element found by {}. Found {} hidden matches (display:none / aria-hidden / zero-rect). Pass --include-hidden to match them anyway.",
+                desc, parsed.hidden_count
+            ));
+        }
         return Err(format!("No element found: {}", desc));
+    }
+
+    if parsed.count > 1 && !allow_ambiguous {
+        let mut detail = String::new();
+        for (i, m) in parsed.matches.iter().enumerate() {
+            detail.push_str(&format!(
+                "\n  [{}] <{} role=\"{}\"{}> {} — {}",
+                i,
+                m.tag,
+                m.role,
+                if m.visible { "" } else { " hidden" },
+                if m.name.is_empty() {
+                    "(no name)".to_string()
+                } else {
+                    format!("\"{}\"", m.name)
+                },
+                m.html,
+            ));
+        }
+        let desc = build_role_selector(role, name, exact);
+        eprintln!(
+            "Ambiguous role match for {}: {} candidates{}",
+            desc, parsed.count, detail
+        );
+        return Err(format!(
+            "Ambiguous role match: {} matched {} elements. Try `--exact`, a more specific `--name`, or `find nth N \"<sel>\"`. Pass `--allow-ambiguous` to accept the first match.",
+            desc, parsed.count
+        ));
     }
 
     let selector = "[data-agent-browser-located='true']";
@@ -6234,6 +6378,39 @@ async fn handle_semantic_locator(
         .and_then(|v| v.as_str())
         .ok_or(format!("Missing '{}' parameter", param_name))?;
     let exact = cmd.get("exact").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    // For "text" strategy, support interactive-element preference + multi-match
+    // surfacing so click-on-ambiguous-text fails loudly instead of silently
+    // picking the first DOM-order leaf.
+    if strategy == "text" {
+        let subaction = cmd
+            .get("subaction")
+            .and_then(|v| v.as_str())
+            .unwrap_or("click");
+        let is_click_like = matches!(subaction, "click" | "dblclick" | "hover" | "tap");
+        let prefer_interactive = cmd
+            .get("preferInteractive")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(is_click_like);
+        let allow_ambiguous = cmd
+            .get("allowAmbiguous")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let include_hidden = cmd
+            .get("includeHidden")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        return locate_text_with_disambiguation(
+            cmd,
+            state,
+            value,
+            exact,
+            prefer_interactive,
+            allow_ambiguous,
+            include_hidden,
+        )
+        .await;
+    }
 
     let match_fn = if exact {
         format!(
@@ -6330,6 +6507,199 @@ async fn handle_semantic_locator(
         .unwrap_or(false)
     {
         return Err(format!("No element found by {} '{}'", strategy, value));
+    }
+
+    let selector = "[data-agent-browser-located='true']";
+    let action_result = execute_subaction(cmd, state, selector).await;
+
+    if let Some(ref browser) = state.browser {
+        let _ = browser
+            .evaluate(
+                "document.querySelector('[data-agent-browser-located]')?.removeAttribute('data-agent-browser-located')",
+                None,
+            )
+            .await;
+    }
+
+    action_result
+}
+
+/// Selector covering the elements we treat as "interactive" when scoring
+/// candidates for `find text`. Mirrors the Playwright/aria heuristic — anything
+/// the user can plausibly click, focus, or activate.
+const INTERACTIVE_CSS_SELECTOR: &str = "a, button, [role=button], [role=link], input[type=submit], input[type=button], [onclick], [role=menuitem], [role=tab], [tabindex]:not([tabindex=\"-1\"])";
+
+/// JS helper that filters out invisible / aria-hidden / zero-rect candidates so
+/// SSR-hydration ghosts and hidden mobile-menu duplicates don't trigger
+/// spurious ambiguity errors. Inlined into the disambiguation IIFEs at use.
+const VISIBILITY_HELPER_JS: &str = r#"
+const isInteractable = (el) => {
+    if (!(el instanceof Element)) return false;
+    if (typeof el.checkVisibility === "function") {
+        if (!el.checkVisibility({ contentVisibilityAuto: true, visibilityProperty: true })) return false;
+    } else if (el.offsetParent === null && getComputedStyle(el).position !== "fixed") {
+        return false;
+    }
+    if (el.closest('[aria-hidden="true"], [hidden], [inert]')) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) return false;
+    return true;
+};
+"#;
+
+#[derive(Debug, serde::Deserialize)]
+struct LeafPreview {
+    tag: String,
+    role: String,
+    name: String,
+    html: String,
+    interactive: bool,
+    #[serde(default = "default_visible")]
+    visible: bool,
+}
+
+fn default_visible() -> bool {
+    true
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct LocateResult {
+    count: u64,
+    matches: Vec<LeafPreview>,
+    #[serde(default, rename = "hiddenCount")]
+    hidden_count: u64,
+}
+
+/// Locate a leaf by visible text with interactive-anchor preference and
+/// multi-match disambiguation. Replaces the original "first leaf wins"
+/// behaviour that silently mis-clicked when the same text appeared on a link
+/// and a nested button (or in headings + buttons).
+async fn locate_text_with_disambiguation(
+    cmd: &Value,
+    state: &mut DaemonState,
+    value: &str,
+    exact: bool,
+    prefer_interactive: bool,
+    allow_ambiguous: bool,
+    include_hidden: bool,
+) -> Result<Value, String> {
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let session_id = mgr.active_session_id()?.to_string();
+
+    let value_json = serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string());
+    let interactive_sel_json = serde_json::to_string(INTERACTIVE_CSS_SELECTOR)
+        .unwrap_or_else(|_| "\"\"".to_string());
+    let match_expr = if exact {
+        format!("el.textContent.trim() === {}", value_json)
+    } else {
+        format!("el.textContent.includes({})", value_json)
+    };
+
+    let js = format!(
+        r#"(() => {{
+            {visibility_helper}
+            const INTERACTIVE_SEL = {interactive_sel};
+            const allLeaves = Array.from(document.querySelectorAll('*'))
+                .filter(el => el.children.length === 0 && {match_expr});
+            const scored = allLeaves.map(el => {{
+                const interactive = el.closest(INTERACTIVE_SEL);
+                return {{ anchor: interactive || el, isInteractive: !!interactive }};
+            }});
+            const preferred = ({prefer_interactive} && scored.some(s => s.isInteractive))
+                ? scored.filter(s => s.isInteractive)
+                : scored;
+            const seen = new Set();
+            const allAnchors = [];
+            for (const s of preferred) {{
+                if (!seen.has(s.anchor)) {{ seen.add(s.anchor); allAnchors.push(s.anchor); }}
+            }}
+            const candidates = {include_hidden} ? allAnchors : allAnchors.filter(isInteractable);
+            const hiddenCount = allAnchors.length - candidates.length;
+            const matches = candidates.slice(0, 5).map(el => ({{
+                tag: el.tagName.toLowerCase(),
+                role: el.getAttribute('role') || '',
+                name: (el.getAttribute('aria-label') || el.textContent || '').trim().slice(0, 60),
+                html: el.outerHTML.slice(0, 200),
+                interactive: el.matches(INTERACTIVE_SEL),
+                visible: isInteractable(el),
+            }}));
+            if (candidates.length === 1 || (candidates.length > 0 && {allow_ambiguous})) {{
+                candidates[0].setAttribute('data-agent-browser-located', 'true');
+            }}
+            return {{ count: candidates.length, hiddenCount, matches }};
+        }})()"#,
+        visibility_helper = VISIBILITY_HELPER_JS,
+        interactive_sel = interactive_sel_json,
+        match_expr = match_expr,
+        prefer_interactive = prefer_interactive,
+        allow_ambiguous = allow_ambiguous,
+        include_hidden = include_hidden,
+    );
+
+    let result: super::cdp::types::EvaluateResult = mgr
+        .client
+        .send_command_typed(
+            "Runtime.evaluate",
+            &super::cdp::types::EvaluateParams {
+                expression: js,
+                return_by_value: Some(true),
+                await_promise: Some(false),
+            },
+            Some(&session_id),
+        )
+        .await?;
+
+    let raw = result
+        .result
+        .value
+        .ok_or_else(|| "find text: empty CDP evaluation result".to_string())?;
+    let parsed: LocateResult = serde_json::from_value(raw)
+        .map_err(|e| format!("find text: invalid CDP evaluation result: {}", e))?;
+
+    if parsed.count == 0 {
+        if parsed.hidden_count > 0 {
+            return Err(format!(
+                "No visible element found by text '{}'. Found {} hidden matches (display:none / aria-hidden / zero-rect). Pass --include-hidden to match them anyway.",
+                value, parsed.hidden_count
+            ));
+        }
+        return Err(format!("No element found by text '{}'", value));
+    }
+
+    if parsed.count > 1 && !allow_ambiguous {
+        let mut detail = String::new();
+        for (i, m) in parsed.matches.iter().enumerate() {
+            detail.push_str(&format!(
+                "\n  [{}] <{}{}{}{}> {} — {}",
+                i,
+                m.tag,
+                if m.role.is_empty() {
+                    String::new()
+                } else {
+                    format!(" role=\"{}\"", m.role)
+                },
+                if m.interactive {
+                    " (interactive)"
+                } else {
+                    ""
+                },
+                if m.visible { "" } else { " hidden" },
+                if m.name.is_empty() {
+                    "(no name)".to_string()
+                } else {
+                    format!("\"{}\"", m.name)
+                },
+                m.html,
+            ));
+        }
+        eprintln!(
+            "Ambiguous text match for '{}': {} candidates{}",
+            value, parsed.count, detail
+        );
+        return Err(format!(
+            "Ambiguous text match: '{}' matched {} elements. Try `--exact`, `find role <role> --name \"{}\" --exact`, or `find nth N \"<sel>\"`. Pass `--allow-ambiguous` to accept the first match.",
+            value, parsed.count, value
+        ));
     }
 
     let selector = "[data-agent-browser-located='true']";

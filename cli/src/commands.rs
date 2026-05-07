@@ -2148,8 +2148,8 @@ fn parse_find(rest: &[&str], id: &str) -> Result<Value, ParseError> {
             let value = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
                 context: format!("find {}", locator),
                 usage: match *locator {
-                    "role" => "find role <role> [action] [--name <name>] [--exact]",
-                    "text" => "find text <text> [action] [--exact]",
+                    "role" => "find role <role> [action] [--name <name>] [--exact] [--allow-ambiguous] [--include-hidden]",
+                    "text" => "find text <text> [action] [--exact] [--no-prefer-interactive] [--allow-ambiguous] [--include-hidden]",
                     "label" => "find label <label> [action] [text] [--exact]",
                     "placeholder" => "find placeholder <text> [action] [text] [--exact]",
                     "alt" => "find alt <text> [action] [--exact]",
@@ -2163,6 +2163,9 @@ fn parse_find(rest: &[&str], id: &str) -> Result<Value, ParseError> {
             let subaction = rest.get(2).unwrap_or(&"click");
             let mut name: Option<&str> = None;
             let mut exact = false;
+            let mut prefer_interactive: Option<bool> = None;
+            let mut allow_ambiguous = false;
+            let mut include_hidden = false;
             let mut fill_parts: Vec<&str> = Vec::new();
 
             if rest.len() > 3 {
@@ -2171,6 +2174,22 @@ fn parse_find(rest: &[&str], id: &str) -> Result<Value, ParseError> {
                     match rest[i] {
                         "--exact" => {
                             exact = true;
+                            i += 1;
+                        }
+                        "--prefer-interactive" => {
+                            prefer_interactive = Some(true);
+                            i += 1;
+                        }
+                        "--no-prefer-interactive" => {
+                            prefer_interactive = Some(false);
+                            i += 1;
+                        }
+                        "--allow-ambiguous" => {
+                            allow_ambiguous = true;
+                            i += 1;
+                        }
+                        "--include-hidden" => {
+                            include_hidden = true;
                             i += 1;
                         }
                         "--name" => {
@@ -2204,11 +2223,27 @@ fn parse_find(rest: &[&str], id: &str) -> Result<Value, ParseError> {
                     if let Some(v) = fill_value {
                         cmd["value"] = json!(v);
                     }
+                    if allow_ambiguous {
+                        cmd["allowAmbiguous"] = json!(true);
+                    }
+                    if include_hidden {
+                        cmd["includeHidden"] = json!(true);
+                    }
                     Ok(cmd)
                 }
-                "text" => Ok(
-                    json!({ "id": id, "action": "getbytext", "text": value, "subaction": subaction, "exact": exact }),
-                ),
+                "text" => {
+                    let mut cmd = json!({ "id": id, "action": "getbytext", "text": value, "subaction": subaction, "exact": exact });
+                    if let Some(p) = prefer_interactive {
+                        cmd["preferInteractive"] = json!(p);
+                    }
+                    if allow_ambiguous {
+                        cmd["allowAmbiguous"] = json!(true);
+                    }
+                    if include_hidden {
+                        cmd["includeHidden"] = json!(true);
+                    }
+                    Ok(cmd)
+                }
                 "label" => {
                     let mut cmd = json!({ "id": id, "action": "getbylabel", "label": value, "subaction": subaction, "exact": exact });
                     if let Some(v) = fill_value {
@@ -4507,6 +4542,81 @@ mod tests {
         assert_eq!(cmd["name"], "username");
         assert_eq!(cmd["exact"], true);
         assert_eq!(cmd["value"], "hello");
+    }
+
+    #[test]
+    fn test_find_text_default_omits_disambiguation_flags() {
+        let cmd = parse_command(&args("find text Login click"), &default_flags()).unwrap();
+        assert_eq!(cmd["action"], "getbytext");
+        assert_eq!(cmd["text"], "Login");
+        assert_eq!(cmd["subaction"], "click");
+        // Defaults are applied in the runtime handler, not the parser.
+        assert!(cmd.get("preferInteractive").is_none());
+        assert!(cmd.get("allowAmbiguous").is_none());
+    }
+
+    #[test]
+    fn test_find_text_allow_ambiguous_flag() {
+        let cmd = parse_command(
+            &args("find text Login click --allow-ambiguous"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["action"], "getbytext");
+        assert_eq!(cmd["allowAmbiguous"], true);
+    }
+
+    #[test]
+    fn test_find_text_no_prefer_interactive_flag() {
+        let cmd = parse_command(
+            &args("find text Login click --no-prefer-interactive"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["action"], "getbytext");
+        assert_eq!(cmd["preferInteractive"], false);
+    }
+
+    #[test]
+    fn test_find_role_allow_ambiguous_flag() {
+        let cmd = parse_command(
+            &args("find role button click --name Login --allow-ambiguous"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["action"], "getbyrole");
+        assert_eq!(cmd["name"], "Login");
+        assert_eq!(cmd["allowAmbiguous"], true);
+    }
+
+    #[test]
+    fn test_find_role_include_hidden_flag() {
+        let cmd = parse_command(
+            &args("find role button click --name Login --include-hidden"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["action"], "getbyrole");
+        assert_eq!(cmd["includeHidden"], true);
+        assert!(cmd.get("allowAmbiguous").is_none());
+    }
+
+    #[test]
+    fn test_find_text_include_hidden_flag() {
+        let cmd = parse_command(
+            &args("find text Login click --include-hidden"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["action"], "getbytext");
+        assert_eq!(cmd["includeHidden"], true);
+    }
+
+    #[test]
+    fn test_find_text_default_omits_include_hidden() {
+        let cmd =
+            parse_command(&args("find text Login click"), &default_flags()).unwrap();
+        assert!(cmd.get("includeHidden").is_none());
     }
 
     // === Download Tests ===

@@ -829,7 +829,14 @@ fn is_transient_error(error: &str) -> bool {
 fn send_command_once(cmd: &Value, session: &str) -> Result<Response, String> {
     let mut stream = connect(session)?;
 
-    stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
+    // Long-running commands (wait, navigate-with-timeout, etc.) declare their
+    // upper bound via `timeout`. Without honoring it here, the IPC client
+    // would time out at 30s and retry by re-sending the same command — queuing
+    // another `state.lock()` holder behind the original and amplifying daemon
+    // contention. Honor the cmd's timeout + 5s for daemon bookkeeping.
+    let cmd_timeout_ms = cmd.get("timeout").and_then(|v| v.as_u64()).unwrap_or(0);
+    let read_timeout = Duration::from_secs(30).max(Duration::from_millis(cmd_timeout_ms + 5_000));
+    stream.set_read_timeout(Some(read_timeout)).ok();
     stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
 
     let mut json_str = serde_json::to_string(cmd).map_err(|e| e.to_string())?;
