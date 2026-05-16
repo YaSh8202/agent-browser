@@ -573,6 +573,32 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                 return Ok(json!({ "id": id, "action": "waitforfunction", "expression": expr }));
             }
 
+            // Check for --stable flag: wait --stable 500 [--timeout ms]
+            // Resolves once the DOM has gone `<ms>` without a MutationObserver
+            // event. Lets scenes drop magic `wait 1500` sleeps.
+            if let Some(idx) = rest.iter().position(|&s| s == "--stable") {
+                let ms_str = rest
+                    .get(idx + 1)
+                    .ok_or_else(|| ParseError::MissingArguments {
+                        context: "wait --stable".to_string(),
+                        usage: "wait --stable <ms>",
+                    })?;
+                let stable_ms = ms_str.parse::<u64>().map_err(|_| ParseError::InvalidValue {
+                    message: format!(
+                        "--stable must be a non-negative integer (ms), got '{}'",
+                        ms_str
+                    ),
+                    usage: "wait --stable <ms>",
+                })?;
+                let mut cmd = json!({ "id": id, "action": "wait", "stable": stable_ms });
+                if let Some(t_idx) = rest.iter().position(|&s| s == "--timeout") {
+                    if let Some(Ok(ms)) = rest.get(t_idx + 1).map(|s| s.parse::<u64>()) {
+                        cmd["timeout"] = json!(ms);
+                    }
+                }
+                return Ok(cmd);
+            }
+
             // Check for --text flag: wait --text "Welcome" [--timeout ms]
             if let Some(idx) = rest.iter().position(|&s| s == "--text" || s == "-t") {
                 let text = rest
@@ -2684,6 +2710,7 @@ fn parse_record_args(
     let mut type_jitter_ms: Option<u64> = None;
     let mut mouse_duration_ms: Option<u64> = None;
     let mut settle_ms: Option<u64> = None;
+    let mut post_click_hold_ms: Option<u64> = None;
     let mut fps: Option<u64> = None;
     let mut log_actions_path: Option<String> = None;
 
@@ -2752,6 +2779,22 @@ fn parse_record_args(
                     message: format!("--settle-ms must be a non-negative integer, got '{}'", v),
                     usage,
                 })?);
+                idx += 1;
+            }
+            "--post-click-hold-ms" => {
+                idx += 1;
+                let v = rest.get(idx).ok_or_else(|| ParseError::MissingArguments {
+                    context: format!("{} --post-click-hold-ms <ms>", action),
+                    usage,
+                })?;
+                post_click_hold_ms =
+                    Some(v.parse::<u64>().map_err(|_| ParseError::InvalidValue {
+                        message: format!(
+                            "--post-click-hold-ms must be a non-negative integer, got '{}'",
+                            v
+                        ),
+                        usage,
+                    })?);
                 idx += 1;
             }
             "--fps" => {
@@ -2828,6 +2871,9 @@ fn parse_record_args(
     }
     if let Some(s) = settle_ms {
         cmd["settleMs"] = json!(s);
+    }
+    if let Some(p) = post_click_hold_ms {
+        cmd["postClickHoldMs"] = json!(p);
     }
     if let Some(f) = fps {
         cmd["fps"] = json!(f);
@@ -3977,6 +4023,38 @@ mod tests {
         assert_eq!(cmd["timeout"], 5000);
     }
 
+    #[test]
+    fn test_wait_stable() {
+        let cmd = parse_command(&args("wait --stable 500"), &default_flags()).unwrap();
+        assert_eq!(cmd["action"], "wait");
+        assert_eq!(cmd["stable"], 500);
+        assert!(cmd.get("timeout").is_none());
+    }
+
+    #[test]
+    fn test_wait_stable_with_timeout() {
+        let cmd = parse_command(
+            &args("wait --stable 500 --timeout 8000"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["action"], "wait");
+        assert_eq!(cmd["stable"], 500);
+        assert_eq!(cmd["timeout"], 8000);
+    }
+
+    #[test]
+    fn test_wait_stable_missing_value() {
+        let result = parse_command(&args("wait --stable"), &default_flags());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_wait_stable_invalid_value() {
+        let result = parse_command(&args("wait --stable abc"), &default_flags());
+        assert!(result.is_err());
+    }
+
     // === Clipboard Tests ===
 
     #[test]
@@ -4069,6 +4147,47 @@ mod tests {
         assert_eq!(cmd["action"], "recording_start");
         assert_eq!(cmd["path"], "demo.webm");
         assert_eq!(cmd["url"], "https://example.com");
+    }
+
+    #[test]
+    fn test_record_start_post_click_hold_ms() {
+        let cmd = parse_command(
+            &args("record start demo.webm --post-click-hold-ms 400"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["action"], "recording_start");
+        assert_eq!(cmd["postClickHoldMs"], 400);
+    }
+
+    #[test]
+    fn test_record_start_post_click_hold_ms_zero_disables() {
+        // Explicit 0 lets users opt out of the dwell when recording-as-test
+        // (faster e2e runs without the polish pause).
+        let cmd = parse_command(
+            &args("record start demo.webm --post-click-hold-ms 0"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["postClickHoldMs"], 0);
+    }
+
+    #[test]
+    fn test_record_start_post_click_hold_ms_missing_value() {
+        let result = parse_command(
+            &args("record start demo.webm --post-click-hold-ms"),
+            &default_flags(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_record_start_post_click_hold_ms_invalid_value() {
+        let result = parse_command(
+            &args("record start demo.webm --post-click-hold-ms slow"),
+            &default_flags(),
+        );
+        assert!(result.is_err());
     }
 
     #[test]

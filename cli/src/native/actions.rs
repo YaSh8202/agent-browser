@@ -2728,6 +2728,7 @@ async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
         &state.iframe_sessions,
     )
     .await?;
+    apply_post_click_hold(state).await;
 
     log_user_action(
         state,
@@ -3163,6 +3164,11 @@ async fn handle_wait(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
     let session_id = mgr.active_session_id()?.to_string();
     let timeout_ms = state.timeout_ms(cmd);
 
+    if let Some(stable_ms) = cmd.get("stable").and_then(|v| v.as_u64()) {
+        wait_for_dom_stable(&mgr.client, &session_id, stable_ms, timeout_ms).await?;
+        return Ok(json!({ "waited": "stable", "ms": stable_ms }));
+    }
+
     if let Some(text) = cmd.get("text").and_then(|v| v.as_str()) {
         wait_for_text(&mgr.client, &session_id, text, timeout_ms).await?;
         return Ok(json!({ "waited": "text", "text": text }));
@@ -3544,6 +3550,57 @@ async fn wait_for_function(
 ) -> Result<(), String> {
     let check_fn = format!("!!({})", fn_str);
     poll_until_true(client, session_id, &check_fn, timeout_ms).await
+}
+
+/// Resolves once a `MutationObserver` on `document` reports no mutations for
+/// `stable_ms`. Replaces the magic `wait <ms>` sleeps that scenes scatter
+/// after navigation/modal-open. The whole wait runs in a single CDP
+/// `Runtime.evaluate` with `await_promise: true`, so the daemon stays
+/// responsive to other commands (notably the recording task).
+async fn wait_for_dom_stable(
+    client: &super::cdp::client::CdpClient,
+    session_id: &str,
+    stable_ms: u64,
+    timeout_ms: u64,
+) -> Result<(), String> {
+    let expr = format!(
+        r#"new Promise((resolve, reject) => {{
+            const STABLE_MS = {stable};
+            const TIMEOUT_MS = {timeout};
+            let settle = null;
+            const overall = setTimeout(() => {{
+                obs.disconnect();
+                reject(new Error("wait --stable: timeout after " + TIMEOUT_MS + "ms"));
+            }}, TIMEOUT_MS);
+            const ping = () => {{
+                clearTimeout(settle);
+                settle = setTimeout(() => {{
+                    obs.disconnect();
+                    clearTimeout(overall);
+                    resolve(true);
+                }}, STABLE_MS);
+            }};
+            const obs = new MutationObserver(ping);
+            obs.observe(document, {{ subtree: true, childList: true, attributes: true, characterData: true }});
+            ping();
+        }})"#,
+        stable = stable_ms,
+        timeout = timeout_ms,
+    );
+
+    let _: super::cdp::types::EvaluateResult = client
+        .send_command_typed(
+            "Runtime.evaluate",
+            &super::cdp::types::EvaluateParams {
+                expression: expr,
+                return_by_value: Some(true),
+                await_promise: Some(true),
+            },
+            Some(session_id),
+        )
+        .await?;
+
+    Ok(())
 }
 
 async fn poll_until_true(
@@ -4344,6 +4401,21 @@ async fn handle_profiler_stop(cmd: &Value, state: &mut DaemonState) -> Result<Va
     native_tracing::profiler_stop(&mgr.client, &session_id, &mut state.tracing_state, path).await
 }
 
+/// Pause execution for the post-click hold configured on the active
+/// recording, if any. Called after user-initiated clicks (`handle_click`,
+/// the find-subaction click path) so playback doesn't snap from one target
+/// straight into the next animation.
+async fn apply_post_click_hold(state: &DaemonState) {
+    if !state.recording_state.active {
+        return;
+    }
+    let ms = state.recording_state.config.cursor.post_click_hold_ms;
+    if ms == 0 {
+        return;
+    }
+    tokio::time::sleep(tokio::time::Duration::from_millis(ms)).await;
+}
+
 /// Build a [`RecordingConfig`] from the flag-derived JSON fields the CLI
 /// parser folds into the `recording_start` / `recording_restart` cmd.
 fn parse_recording_config(cmd: &Value) -> RecordingConfig {
@@ -4368,6 +4440,9 @@ fn parse_recording_config(cmd: &Value) -> RecordingConfig {
     }
     if let Some(s) = cmd.get("settleMs").and_then(|v| v.as_u64()) {
         cfg.cursor.settle_ms = s;
+    }
+    if let Some(p) = cmd.get("postClickHoldMs").and_then(|v| v.as_u64()) {
+        cfg.cursor.post_click_hold_ms = p;
     }
     if let Some(f) = cmd.get("fps").and_then(|v| v.as_u64()) {
         cfg.fps = f.clamp(1, 60) as u32;
@@ -6113,6 +6188,7 @@ async fn execute_subaction(
                 &state.iframe_sessions,
             )
             .await?;
+            apply_post_click_hold(state).await;
             log_user_action(
                 state,
                 "click",
@@ -6226,6 +6302,38 @@ fn build_role_selector(role: &str, name: Option<&str>, exact: bool) -> String {
     }
 }
 
+// CSS selector list for an ARIA role, including the elements that carry that
+// role implicitly. The previous `[role="X"], X` approach only matched the
+// explicit attribute and the literal HTML tag name — so `find role link` would
+// match `<link>` head metadata instead of `<a href>` anchors. This mirrors the
+// Playwright/aria implicit-role mapping for the common cases.
+fn implicit_role_selector(role: &str) -> String {
+    match role {
+        "link" => r#"a[href], [role="link"]"#.into(),
+        "button" => {
+            r#"button, [role="button"], input[type="button"], input[type="submit"], input[type="reset"]"#
+                .into()
+        }
+        "heading" => r#"h1, h2, h3, h4, h5, h6, [role="heading"]"#.into(),
+        "textbox" => {
+            r#"input:not([type="button"]):not([type="submit"]):not([type="checkbox"]):not([type="radio"]):not([type="hidden"]):not([type="reset"]):not([type="image"]), textarea, [role="textbox"], [contenteditable="true"]"#
+                .into()
+        }
+        "checkbox" => r#"input[type="checkbox"], [role="checkbox"]"#.into(),
+        "radio" => r#"input[type="radio"], [role="radio"]"#.into(),
+        "combobox" => r#"select, [role="combobox"]"#.into(),
+        "img" => r#"img:not([alt=""]), [role="img"]"#.into(),
+        "tab" | "menuitem" | "menuitemcheckbox" | "menuitemradio" | "switch" | "option"
+        | "listbox" | "dialog" | "alert" | "tooltip" | "progressbar" | "slider" | "spinbutton" => {
+            format!(r#"[role="{role}"]"#)
+        }
+        // Fallback: explicit role + literal tag (legacy behaviour for roles
+        // we haven't enumerated; works for elements whose tag name matches
+        // the role like `nav`, `main`, `header`, `footer`).
+        _ => format!(r#"[role="{role}"], {role}"#),
+    }
+}
+
 async fn handle_getbyrole(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
@@ -6246,42 +6354,56 @@ async fn handle_getbyrole(cmd: &Value, state: &mut DaemonState) -> Result<Value,
 
     let name_match = name
         .map(|n| {
+            let nj = serde_json::to_string(n).unwrap_or_default();
             if exact {
-                format!(
-                    "el.getAttribute('aria-label') === {} || el.textContent.trim() === {}",
-                    serde_json::to_string(n).unwrap_or_default(),
-                    serde_json::to_string(n).unwrap_or_default()
-                )
+                format!("accessibleName(el) === {nj}")
             } else {
-                format!(
-                    "(el.getAttribute('aria-label') || '').includes({n}) || el.textContent.includes({n})",
-                    n = serde_json::to_string(n).unwrap_or_default()
-                )
+                format!("accessibleName(el).toLowerCase().includes({nj}.toLowerCase())")
             }
         })
         .unwrap_or_else(|| "true".to_string());
 
+    let role_selector = implicit_role_selector(role);
+    let role_selector_json =
+        serde_json::to_string(&role_selector).unwrap_or_else(|_| "\"*\"".to_string());
+
+    // Async IIFE so we can await two requestAnimationFrames before re-querying
+    // when initial match count > 1. SSR/hydration on Next.js + shadcn pages
+    // commonly produces 6+ duplicate buttons during the first ~100-300ms; if
+    // we error immediately the agent burns turns on phantom ambiguity.
     let js = format!(
-        r#"(() => {{
+        r#"(async () => {{
             {visibility_helper}
-            const els = Array.from(document.querySelectorAll('[role="{role}"], {role}'));
-            const rawMatches = els.filter(el => {name_match});
-            const candidates = {include_hidden} ? rawMatches : rawMatches.filter(isInteractable);
-            const hiddenCount = rawMatches.length - candidates.length;
-            const matches = candidates.slice(0, 5).map(el => ({{
-                tag: el.tagName.toLowerCase(),
-                role: el.getAttribute('role') || '{role}',
-                name: (el.getAttribute('aria-label') || el.textContent || '').trim().slice(0, 60),
-                html: el.outerHTML.slice(0, 200),
-                interactive: true,
-                visible: isInteractable(el),
-            }}));
-            if (candidates.length === 1 || (candidates.length > 0 && {allow_ambiguous})) {{
-                candidates[0].setAttribute('data-agent-browser-located', 'true');
+            {accessible_name_helper}
+            const ROLE_SEL = {role_selector};
+            const run = () => {{
+                const els = Array.from(document.querySelectorAll(ROLE_SEL));
+                const rawMatches = els.filter(el => {name_match});
+                const candidates = {include_hidden} ? rawMatches : rawMatches.filter(isInteractable);
+                const hiddenCount = rawMatches.length - candidates.length;
+                const matches = candidates.slice(0, 5).map(el => ({{
+                    tag: el.tagName.toLowerCase(),
+                    role: el.getAttribute('role') || '{role}',
+                    name: accessibleName(el).slice(0, 60),
+                    html: el.outerHTML.slice(0, 200),
+                    interactive: true,
+                    visible: isInteractable(el),
+                }}));
+                return {{ candidates, count: candidates.length, hiddenCount, matches }};
+            }};
+            let r = run();
+            if (r.count > 1) {{
+                await new Promise((res) => requestAnimationFrame(() => requestAnimationFrame(res)));
+                r = run();
             }}
-            return {{ count: candidates.length, hiddenCount, matches }};
+            if (r.count === 1 || (r.count > 0 && {allow_ambiguous})) {{
+                r.candidates[0].setAttribute('data-agent-browser-located', 'true');
+            }}
+            return {{ count: r.count, hiddenCount: r.hiddenCount, matches: r.matches }};
         }})()"#,
         visibility_helper = VISIBILITY_HELPER_JS,
+        accessible_name_helper = ACCESSIBLE_NAME_HELPER_JS,
+        role_selector = role_selector_json,
         role = role,
         name_match = name_match,
         allow_ambiguous = allow_ambiguous,
@@ -6295,7 +6417,7 @@ async fn handle_getbyrole(cmd: &Value, state: &mut DaemonState) -> Result<Value,
             &super::cdp::types::EvaluateParams {
                 expression: js,
                 return_by_value: Some(true),
-                await_promise: Some(false),
+                await_promise: Some(true),
             },
             Some(&session_id),
         )
@@ -6312,11 +6434,11 @@ async fn handle_getbyrole(cmd: &Value, state: &mut DaemonState) -> Result<Value,
         let desc = build_role_selector(role, name, exact);
         if parsed.hidden_count > 0 {
             return Err(format!(
-                "No visible element found by {}. Found {} hidden matches (display:none / aria-hidden / zero-rect). Pass --include-hidden to match them anyway.",
-                desc, parsed.hidden_count
+                "No visible element found by {desc}. Found {} hidden matches (display:none / aria-hidden / zero-rect). Pass --include-hidden to match them anyway.",
+                parsed.hidden_count,
             ));
         }
-        return Err(format!("No element found: {}", desc));
+        return Err(format!("No element found: {desc}"));
     }
 
     if parsed.count > 1 && !allow_ambiguous {
@@ -6342,8 +6464,8 @@ async fn handle_getbyrole(cmd: &Value, state: &mut DaemonState) -> Result<Value,
             desc, parsed.count, detail
         );
         return Err(format!(
-            "Ambiguous role match: {} matched {} elements. Try `--exact`, a more specific `--name`, or `find nth N \"<sel>\"`. Pass `--allow-ambiguous` to accept the first match.",
-            desc, parsed.count
+            "Ambiguous role match: {desc} matched {n} elements:{detail}\nTry: `--exact`, a more specific `--name`, a CSS attribute selector (e.g. `click 'form button[type=\"submit\"]'`), or a snapshot ref (`agent-browser snapshot -i` then `click @eN`). Pass `--allow-ambiguous` to accept the first match.",
+            n = parsed.count,
         ));
     }
 
@@ -6547,6 +6669,23 @@ const isInteractable = (el) => {
 };
 "#;
 
+// JS helper to compute an accessible-ish name. Prefers aria-label; otherwise
+// returns trimmed textContent with one common shadcn pathology stripped: the
+// "responsive duplicate span" pattern (`<span class="hidden md:inline">X</span>
+// <span class="md:hidden">X</span>`) which makes textContent return "XX".
+const ACCESSIBLE_NAME_HELPER_JS: &str = r#"
+const accessibleName = (el) => {
+    const aria = el.getAttribute && el.getAttribute("aria-label");
+    if (aria) return aria.trim();
+    let t = (el.textContent || "").replace(/\s+/g, " ").trim();
+    const half = t.length / 2;
+    if (Number.isInteger(half) && half > 0 && t.slice(0, half) === t.slice(half)) {
+        t = t.slice(0, half);
+    }
+    return t;
+};
+"#;
+
 #[derive(Debug, serde::Deserialize)]
 struct LeafPreview {
     tag: String,
@@ -6596,37 +6735,45 @@ async fn locate_text_with_disambiguation(
     };
 
     let js = format!(
-        r#"(() => {{
+        r#"(async () => {{
             {visibility_helper}
             const INTERACTIVE_SEL = {interactive_sel};
-            const allLeaves = Array.from(document.querySelectorAll('*'))
-                .filter(el => el.children.length === 0 && {match_expr});
-            const scored = allLeaves.map(el => {{
-                const interactive = el.closest(INTERACTIVE_SEL);
-                return {{ anchor: interactive || el, isInteractive: !!interactive }};
-            }});
-            const preferred = ({prefer_interactive} && scored.some(s => s.isInteractive))
-                ? scored.filter(s => s.isInteractive)
-                : scored;
-            const seen = new Set();
-            const allAnchors = [];
-            for (const s of preferred) {{
-                if (!seen.has(s.anchor)) {{ seen.add(s.anchor); allAnchors.push(s.anchor); }}
+            const run = () => {{
+                const allLeaves = Array.from(document.querySelectorAll('*'))
+                    .filter(el => el.children.length === 0 && {match_expr});
+                const scored = allLeaves.map(el => {{
+                    const interactive = el.closest(INTERACTIVE_SEL);
+                    return {{ anchor: interactive || el, isInteractive: !!interactive }};
+                }});
+                const preferred = ({prefer_interactive} && scored.some(s => s.isInteractive))
+                    ? scored.filter(s => s.isInteractive)
+                    : scored;
+                const seen = new Set();
+                const allAnchors = [];
+                for (const s of preferred) {{
+                    if (!seen.has(s.anchor)) {{ seen.add(s.anchor); allAnchors.push(s.anchor); }}
+                }}
+                const candidates = {include_hidden} ? allAnchors : allAnchors.filter(isInteractable);
+                const hiddenCount = allAnchors.length - candidates.length;
+                const matches = candidates.slice(0, 5).map(el => ({{
+                    tag: el.tagName.toLowerCase(),
+                    role: el.getAttribute('role') || '',
+                    name: (el.getAttribute('aria-label') || el.textContent || '').trim().slice(0, 60),
+                    html: el.outerHTML.slice(0, 200),
+                    interactive: el.matches(INTERACTIVE_SEL),
+                    visible: isInteractable(el),
+                }}));
+                return {{ candidates, count: candidates.length, hiddenCount, matches }};
+            }};
+            let r = run();
+            if (r.count > 1) {{
+                await new Promise((res) => requestAnimationFrame(() => requestAnimationFrame(res)));
+                r = run();
             }}
-            const candidates = {include_hidden} ? allAnchors : allAnchors.filter(isInteractable);
-            const hiddenCount = allAnchors.length - candidates.length;
-            const matches = candidates.slice(0, 5).map(el => ({{
-                tag: el.tagName.toLowerCase(),
-                role: el.getAttribute('role') || '',
-                name: (el.getAttribute('aria-label') || el.textContent || '').trim().slice(0, 60),
-                html: el.outerHTML.slice(0, 200),
-                interactive: el.matches(INTERACTIVE_SEL),
-                visible: isInteractable(el),
-            }}));
-            if (candidates.length === 1 || (candidates.length > 0 && {allow_ambiguous})) {{
-                candidates[0].setAttribute('data-agent-browser-located', 'true');
+            if (r.count === 1 || (r.count > 0 && {allow_ambiguous})) {{
+                r.candidates[0].setAttribute('data-agent-browser-located', 'true');
             }}
-            return {{ count: candidates.length, hiddenCount, matches }};
+            return {{ count: r.count, hiddenCount: r.hiddenCount, matches: r.matches }};
         }})()"#,
         visibility_helper = VISIBILITY_HELPER_JS,
         interactive_sel = interactive_sel_json,
@@ -6643,7 +6790,7 @@ async fn locate_text_with_disambiguation(
             &super::cdp::types::EvaluateParams {
                 expression: js,
                 return_by_value: Some(true),
-                await_promise: Some(false),
+                await_promise: Some(true),
             },
             Some(&session_id),
         )
@@ -6697,8 +6844,9 @@ async fn locate_text_with_disambiguation(
             value, parsed.count, detail
         );
         return Err(format!(
-            "Ambiguous text match: '{}' matched {} elements. Try `--exact`, `find role <role> --name \"{}\" --exact`, or `find nth N \"<sel>\"`. Pass `--allow-ambiguous` to accept the first match.",
-            value, parsed.count, value
+            "Ambiguous text match: '{val}' matched {n} elements:{detail}\nTry: `--exact`, `find role <role> --name \"{val}\" --exact`, a CSS attribute selector (e.g. `click 'form button[type=\"submit\"]'`), or a snapshot ref (`agent-browser snapshot -i` then `click @eN`). Pass `--allow-ambiguous` to accept the first match.",
+            val = value,
+            n = parsed.count,
         ));
     }
 
@@ -8922,6 +9070,81 @@ mod tests {
     use super::*;
     use crate::test_utils::EnvGuard;
     use std::fs;
+
+    #[test]
+    fn implicit_role_selector_maps_link_to_anchors() {
+        let sel = implicit_role_selector("link");
+        assert!(
+            sel.contains("a[href]"),
+            "find role link must match `<a href>` anchors, got: {sel}"
+        );
+        assert!(
+            !sel.contains(", link"),
+            "find role link must NOT match the `<link>` head tag, got: {sel}"
+        );
+        assert!(sel.contains(r#"[role="link"]"#));
+    }
+
+    #[test]
+    fn implicit_role_selector_button_includes_input_submit() {
+        let sel = implicit_role_selector("button");
+        assert!(sel.contains("button"));
+        assert!(
+            sel.contains(r#"input[type="submit"]"#),
+            "find role button must match form submit inputs, got: {sel}"
+        );
+        assert!(sel.contains(r#"[role="button"]"#));
+    }
+
+    #[test]
+    fn implicit_role_selector_textbox_excludes_non_text_inputs() {
+        let sel = implicit_role_selector("textbox");
+        assert!(sel.contains("textarea"));
+        assert!(sel.contains(r#"[contenteditable="true"]"#));
+        assert!(
+            sel.contains(r#":not([type="checkbox"])"#),
+            "textbox must exclude checkbox inputs, got: {sel}"
+        );
+        assert!(sel.contains(r#":not([type="hidden"])"#));
+    }
+
+    #[test]
+    fn implicit_role_selector_heading_covers_h1_through_h6() {
+        let sel = implicit_role_selector("heading");
+        for h in ["h1", "h2", "h3", "h4", "h5", "h6"] {
+            assert!(sel.contains(h), "heading selector missing {h}: {sel}");
+        }
+        assert!(sel.contains(r#"[role="heading"]"#));
+    }
+
+    #[test]
+    fn implicit_role_selector_unknown_role_falls_back_to_legacy() {
+        // Unknown role names (e.g. landmark roles like `nav`, `main`) should
+        // still match the explicit attribute + literal tag. This preserves
+        // the pre-fix behaviour for callers depending on it.
+        let sel = implicit_role_selector("nav");
+        assert!(sel.contains(r#"[role="nav"]"#));
+        assert!(sel.contains(", nav"));
+    }
+
+    #[test]
+    fn accessible_name_helper_strips_shadcn_dual_span() {
+        // shadcn responsive buttons emit two spans with identical text;
+        // textContent concatenates them ("Add ServerAdd Server"). The helper
+        // collapses one repeat so `--exact "Add Server"` matches.
+        assert!(
+            ACCESSIBLE_NAME_HELPER_JS.contains("accessibleName"),
+            "helper must expose `accessibleName` for the role/text matchers"
+        );
+        assert!(
+            ACCESSIBLE_NAME_HELPER_JS.contains("aria-label"),
+            "helper must prefer aria-label over textContent"
+        );
+        assert!(
+            ACCESSIBLE_NAME_HELPER_JS.contains("t.slice(0, half) === t.slice(half)"),
+            "helper must collapse duplicate-half textContent (shadcn dual-span)"
+        );
+    }
 
     fn unique_socket_dir(label: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()

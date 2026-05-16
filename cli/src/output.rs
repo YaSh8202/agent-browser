@@ -1546,6 +1546,7 @@ Modes:
   --load <state>       Wait for load state (load, domcontentloaded, networkidle)
   --fn <expression>    Wait for JavaScript expression to be truthy
   --text <text>        Wait for text to appear on page (substring match)
+  --stable <ms>        Wait until DOM has been mutation-free for <ms> (default timeout 30s; pass --timeout)
   --download [path]    Wait for a download to complete (optionally save to path)
 
 Download Options (with --download):
@@ -2303,6 +2304,7 @@ Natural-mode flags (override individual defaults):
   --type-jitter <ms>                Random jitter added to --type-delay (default 25)
   --mouse-duration <ms>             Cursor animation duration (default 450, floor 200)
   --settle-ms <ms>                  Pause after the cursor lands (default 250)
+  --post-click-hold-ms <ms>         Pause after each click before the next action (default 250; 0 disables)
   --fps <n>                         Capture frame rate, 1..=60 (default 10; bump to 30 for smoother cursor)
   --log-actions <path>              Write a JSONL action timeline alongside the video
 

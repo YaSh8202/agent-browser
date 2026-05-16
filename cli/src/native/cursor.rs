@@ -21,6 +21,11 @@ pub struct CursorConfig {
     pub auto_cursor: bool,
     pub mouse_duration_ms: u64,
     pub settle_ms: u64,
+    /// Pause held *after* the click dispatches before the next action runs.
+    /// Without this, the cursor visibly snaps from one target to the next on
+    /// playback — recordings feel rushed. 250ms is enough that a viewer
+    /// registers each interaction as a discrete event.
+    pub post_click_hold_ms: u64,
     pub type_delay_ms: u64,
     pub type_jitter_ms: u64,
 }
@@ -32,6 +37,7 @@ impl CursorConfig {
             auto_cursor: true,
             mouse_duration_ms: 450,
             settle_ms: 250,
+            post_click_hold_ms: 250,
             type_delay_ms: 65,
             type_jitter_ms: 25,
         }
@@ -44,6 +50,7 @@ impl CursorConfig {
             auto_cursor: false,
             mouse_duration_ms: 0,
             settle_ms: 0,
+            post_click_hold_ms: 0,
             type_delay_ms: 0,
             type_jitter_ms: 0,
         }
@@ -211,6 +218,7 @@ mod tests {
         assert_eq!(cfg.type_delay_ms, 0);
         assert_eq!(cfg.type_jitter_ms, 0);
         assert_eq!(cfg.settle_ms, 0);
+        assert_eq!(cfg.post_click_hold_ms, 0);
     }
 
     #[test]

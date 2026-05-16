@@ -231,6 +231,18 @@ pub fn build_ffmpeg_command(output_path: &str, fps: u32) -> tokio::process::Comm
             "-analyzeduration",
             "0",
         ])
+        // Use the screenshot arrival wall-clock to timestamp frames, and let
+        // ffmpeg generate a presentation timestamp for each. Without these,
+        // ffmpeg encodes whatever frames make it through the pipe at the
+        // requested input fps spec, so dropped frames produce a video shorter
+        // than real time (a 30 FPS request on a slow machine yields ~50%
+        // playback speed).
+        .args([
+            "-fflags",
+            "+genpts",
+            "-use_wallclock_as_timestamps",
+            "1",
+        ])
         .args([
             "-f",
             "image2pipe",
@@ -241,7 +253,11 @@ pub fn build_ffmpeg_command(output_path: &str, fps: u32) -> tokio::process::Comm
             "-i",
             "pipe:0",
         ])
-        .args(["-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2"]);
+        .args(["-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2"])
+        // Emit a variable-frame-rate output that respects the wall-clock PTS
+        // we generated above, so the playback duration always matches real
+        // time even when the encoder drops frames.
+        .args(["-vsync", "vfr"]);
 
     if output_path.ends_with(".webm") {
         cmd.args(["-c:v", "libvpx", "-crf", "30", "-b:v", "1M"]);
@@ -390,6 +406,67 @@ mod tests {
         assert!(!state.active);
         assert!(state.output_path.is_empty());
         assert_eq!(state.frame_count, 0);
+    }
+
+    /// Verify ffmpeg gets the wall-clock-VFR flags that fix the "fps 30 →
+    /// half-speed video" bug. Without `-use_wallclock_as_timestamps 1` and
+    /// `-vsync vfr`, dropped frames produce a video shorter than real time.
+    fn ffmpeg_args(cmd: &tokio::process::Command) -> Vec<String> {
+        cmd.as_std()
+            .get_args()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn ffmpeg_command_uses_wallclock_timestamps() {
+        let cmd = build_ffmpeg_command("/tmp/scene.webm", 30);
+        let args = ffmpeg_args(&cmd);
+        let pos = args
+            .iter()
+            .position(|a| a == "-use_wallclock_as_timestamps")
+            .expect("wallclock timestamps flag must be present");
+        assert_eq!(
+            args.get(pos + 1).map(|s| s.as_str()),
+            Some("1"),
+            "-use_wallclock_as_timestamps must be set to 1"
+        );
+    }
+
+    #[test]
+    fn ffmpeg_command_uses_genpts_and_vfr() {
+        let cmd = build_ffmpeg_command("/tmp/scene.webm", 30);
+        let args = ffmpeg_args(&cmd);
+        // +genpts pairs with wallclock so ffmpeg writes a presentation
+        // timestamp for each frame even without input PTS.
+        let fflags_pos = args
+            .iter()
+            .position(|a| a == "-fflags")
+            .expect("-fflags must be present");
+        assert_eq!(args.get(fflags_pos + 1).map(|s| s.as_str()), Some("+genpts"));
+
+        // -vsync vfr makes the output respect the wallclock PTS instead of
+        // forcing a constant input fps.
+        let vsync_pos = args
+            .iter()
+            .position(|a| a == "-vsync")
+            .expect("-vsync must be present");
+        assert_eq!(args.get(vsync_pos + 1).map(|s| s.as_str()), Some("vfr"));
+    }
+
+    #[test]
+    fn ffmpeg_command_threads_branches_on_fps() {
+        // Sanity: high fps still gets `-threads 0` (whole CPU) and low fps
+        // stays single-threaded; the wallclock change must not have
+        // regressed the fps-derived threads logic.
+        let low = build_ffmpeg_command("/tmp/a.webm", 10);
+        let high = build_ffmpeg_command("/tmp/b.webm", 30);
+        let lo_args = ffmpeg_args(&low);
+        let hi_args = ffmpeg_args(&high);
+        let lo_threads = lo_args.iter().position(|a| a == "-threads").unwrap();
+        let hi_threads = hi_args.iter().position(|a| a == "-threads").unwrap();
+        assert_eq!(lo_args[lo_threads + 1], "1");
+        assert_eq!(hi_args[hi_threads + 1], "0");
     }
 
     #[test]
