@@ -762,6 +762,25 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                 ));
             }
 
+            // Check for --stable flag: wait --stable 500
+            // Resolves once the DOM has gone `<ms>` without a MutationObserver
+            // event. Lets scripts drop magic `wait 1500` sleeps.
+            if let Some(idx) = rest.iter().position(|&s| s == "--stable") {
+                let raw = rest
+                    .get(idx + 1)
+                    .ok_or_else(|| ParseError::MissingArguments {
+                        context: "wait --stable".to_string(),
+                        usage: "wait --stable <ms>",
+                    })?;
+                let stable_ms = raw.parse::<u64>().map_err(|_| ParseError::InvalidValue {
+                    message: format!("--stable expects a number in ms, got '{}'", raw),
+                    usage: "wait --stable <ms>",
+                })?;
+                return Ok(with_timeout(
+                    json!({ "id": id, "action": "wait", "stable": stable_ms }),
+                ));
+            }
+
             // Check for --text flag: wait --text "Welcome"
             if let Some(idx) = rest.iter().position(|&s| s == "--text" || s == "-t") {
                 let text = rest
@@ -1741,7 +1760,7 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                     "recording_start",
                     &rest[1..],
                     "record start",
-                    "record start <output.webm|output.mp4> [url] [--fps <n>] [--cursor] [--contact-sheet] [--contact-sheet-threshold <0-1>]",
+                    "record start <output.webm|output.mp4> [url] [--fps <n>] [--cursor] [--contact-sheet] [--contact-sheet-threshold <0-1>] [--log-actions <path>]",
                 ),
                 Some("stop") => Ok(json!({ "id": id, "action": "recording_stop" })),
                 Some("restart") => parse_record_take(
@@ -1749,7 +1768,7 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                     "recording_restart",
                     &rest[1..],
                     "record restart",
-                    "record restart <output.webm|output.mp4> [url] [--fps <n>] [--cursor] [--contact-sheet] [--contact-sheet-threshold <0-1>]",
+                    "record restart <output.webm|output.mp4> [url] [--fps <n>] [--cursor] [--contact-sheet] [--contact-sheet-threshold <0-1>] [--log-actions <path>]",
                 ),
                 Some(sub) => Err(ParseError::UnknownSubcommand {
                     subcommand: sub.to_string(),
@@ -2400,8 +2419,8 @@ fn parse_read(rest: &[&str], id: &str, flags: &Flags) -> Result<Value, ParseErro
 }
 
 /// Parse the arguments shared by `record start` and `record restart`:
-/// `<path> [url] [--fps <n>] [--cursor] [--contact-sheet]` plus an optional
-/// contact-sheet pixel-difference threshold.
+/// `<path> [url] [--fps <n>] [--cursor] [--contact-sheet] [--log-actions <path>]`
+/// plus an optional contact-sheet pixel-difference threshold.
 ///
 /// `rest` excludes the subcommand. `path` needs an extension so ffmpeg can
 /// pick a container (`.webm` and `.mp4` are the tuned ones). Recording
@@ -2422,6 +2441,7 @@ fn parse_record_take(
     let mut cursor = false;
     let mut contact_sheet = false;
     let mut contact_sheet_threshold: Option<f64> = None;
+    let mut log_actions: Option<&str> = None;
 
     let mut i = 0;
     while i < rest.len() {
@@ -2484,6 +2504,16 @@ fn parse_record_take(
                 contact_sheet_threshold = Some(parsed);
                 i += 2;
             }
+            "--log-actions" => {
+                let value = rest
+                    .get(i + 1)
+                    .ok_or_else(|| ParseError::MissingArguments {
+                        context: format!("{} --log-actions", context),
+                        usage,
+                    })?;
+                log_actions = Some(value);
+                i += 2;
+            }
             flag if flag.starts_with("--") => {
                 return Err(ParseError::InvalidValue {
                     message: format!("Unknown flag for {}: {}", context, flag),
@@ -2532,6 +2562,9 @@ fn parse_record_take(
     }
     if let Some(threshold) = contact_sheet_threshold {
         cmd["contactSheetThreshold"] = json!(threshold);
+    }
+    if let Some(log_path) = log_actions {
+        cmd["logActions"] = json!(log_path);
     }
     Ok(cmd)
 }
@@ -3011,8 +3044,8 @@ fn parse_find(rest: &[&str], id: &str) -> Result<Value, ParseError> {
             let value = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
                 context: format!("find {}", locator),
                 usage: match *locator {
-                    "role" => "find role <role> [action] [--name <name>] [--exact]",
-                    "text" => "find text <text> [action] [value] [--exact]",
+                    "role" => "find role <role> [action] [--name <name>] [--exact] [--allow-ambiguous]",
+                    "text" => "find text <text> [action] [value] [--exact] [--allow-ambiguous] [--include-hidden] [--no-prefer-interactive]",
                     "label" => "find label <label> [action] [text] [--exact]",
                     "placeholder" => "find placeholder <text> [action] [text] [--exact]",
                     "alt" => "find alt <text> [action] [value] [--exact]",
@@ -3026,6 +3059,9 @@ fn parse_find(rest: &[&str], id: &str) -> Result<Value, ParseError> {
             let subaction = rest.get(2).unwrap_or(&"click");
             let mut name: Option<&str> = None;
             let mut exact = false;
+            let mut allow_ambiguous = false;
+            let mut include_hidden = false;
+            let mut prefer_interactive: Option<bool> = None;
             let mut fill_parts: Vec<&str> = Vec::new();
 
             if rest.len() > 3 {
@@ -3034,6 +3070,18 @@ fn parse_find(rest: &[&str], id: &str) -> Result<Value, ParseError> {
                     match rest[i] {
                         "--exact" => {
                             exact = true;
+                            i += 1;
+                        }
+                        "--allow-ambiguous" => {
+                            allow_ambiguous = true;
+                            i += 1;
+                        }
+                        "--include-hidden" => {
+                            include_hidden = true;
+                            i += 1;
+                        }
+                        "--prefer-interactive" | "--no-prefer-interactive" => {
+                            prefer_interactive = Some(rest[i] == "--prefer-interactive");
                             i += 1;
                         }
                         "--name" => {
@@ -3067,12 +3115,24 @@ fn parse_find(rest: &[&str], id: &str) -> Result<Value, ParseError> {
                     if let Some(v) = fill_value {
                         cmd["value"] = json!(v);
                     }
+                    if allow_ambiguous {
+                        cmd["allowAmbiguous"] = json!(true);
+                    }
                     Ok(cmd)
                 }
                 "text" => {
                     let mut cmd = json!({ "id": id, "action": "getbytext", "text": value, "subaction": subaction, "exact": exact });
                     if let Some(v) = fill_value {
                         cmd["value"] = json!(v);
+                    }
+                    if allow_ambiguous {
+                        cmd["allowAmbiguous"] = json!(true);
+                    }
+                    if include_hidden {
+                        cmd["includeHidden"] = json!(true);
+                    }
+                    if let Some(prefer) = prefer_interactive {
+                        cmd["preferInteractive"] = json!(prefer);
                     }
                     Ok(cmd)
                 }
@@ -4982,6 +5042,28 @@ mod tests {
     }
 
     #[test]
+    fn test_wait_stable() {
+        let cmd = parse_command(&args("wait --stable 500"), &default_flags()).unwrap();
+        assert_eq!(cmd["action"], "wait");
+        assert_eq!(cmd["stable"], 500);
+        assert!(cmd.get("timeout").is_none());
+    }
+
+    #[test]
+    fn test_wait_stable_with_timeout() {
+        let cmd =
+            parse_command(&args("wait --stable 500 --timeout 8000"), &default_flags()).unwrap();
+        assert_eq!(cmd["stable"], 500);
+        assert_eq!(cmd["timeout"], 8000);
+    }
+
+    #[test]
+    fn test_wait_stable_rejects_missing_or_invalid_value() {
+        assert!(parse_command(&args("wait --stable"), &default_flags()).is_err());
+        assert!(parse_command(&args("wait --stable abc"), &default_flags()).is_err());
+    }
+
+    #[test]
     fn test_wait_text() {
         let cmd = parse_command(&args("wait --text Welcome"), &default_flags()).unwrap();
         assert_eq!(cmd["action"], "wait");
@@ -5071,6 +5153,31 @@ mod tests {
         assert!(cmd.get("url").is_none());
         // Omitting --fps lets the daemon apply its 30 fps default.
         assert!(cmd.get("fps").is_none());
+    }
+
+    #[test]
+    fn test_record_log_actions() {
+        let cmd = parse_command(
+            &args("record start output.webm --log-actions /tmp/take.jsonl --cursor"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["logActions"], "/tmp/take.jsonl");
+        assert_eq!(cmd["cursor"], true);
+
+        let cmd = parse_command(
+            &args("record restart output.webm --log-actions /tmp/take.jsonl"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["action"], "recording_restart");
+        assert_eq!(cmd["logActions"], "/tmp/take.jsonl");
+
+        assert!(parse_command(
+            &args("record start output.webm --log-actions"),
+            &default_flags()
+        )
+        .is_err());
     }
 
     #[test]
@@ -5616,6 +5723,30 @@ mod tests {
     fn test_set_viewport_invalid_scale() {
         let result = parse_command(&args("set viewport 1920 1080 abc"), &default_flags());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_find_disambiguation_flags() {
+        let cmd = parse_command(
+            &args("find role button click --name Login --allow-ambiguous"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["allowAmbiguous"], true);
+        assert_eq!(cmd["name"], "Login");
+        assert!(
+            cmd.get("value").is_none(),
+            "flags must not leak into the value"
+        );
+
+        let cmd = parse_command(
+            &args("find text Login click --include-hidden --no-prefer-interactive"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["includeHidden"], true);
+        assert_eq!(cmd["preferInteractive"], false);
+        assert!(cmd.get("allowAmbiguous").is_none());
     }
 
     #[test]

@@ -126,6 +126,8 @@ pub async fn hover(
     Ok((x + offset.0, y + offset.1))
 }
 
+/// With `human_seed`, the value is typed key by key at a human pace instead
+/// of inserted at once.
 pub async fn fill(
     client: &CdpClient,
     session_id: &str,
@@ -133,6 +135,7 @@ pub async fn fill(
     selector_or_ref: &str,
     value: &str,
     iframe_sessions: &HashMap<String, String>,
+    human_seed: Option<u64>,
 ) -> Result<(), String> {
     let (object_id, effective_session_id) = resolve_element_object_id(
         client,
@@ -178,6 +181,10 @@ pub async fn fill(
         )
         .await?;
 
+    if human_seed.is_some() {
+        return type_text_into_active_context(client, session_id, value, None, human_seed).await;
+    }
+
     // Insert text (keyboard input dispatched at page level, use parent session_id)
     client
         .send_command_typed::<_, Value>(
@@ -202,6 +209,7 @@ pub async fn type_text(
     clear: bool,
     delay_ms: Option<u64>,
     iframe_sessions: &HashMap<String, String>,
+    human_seed: Option<u64>,
 ) -> Result<(), String> {
     let (object_id, effective_session_id) = resolve_element_object_id(
         client,
@@ -248,18 +256,34 @@ pub async fn type_text(
             .await?;
     }
 
-    type_text_into_active_context(client, session_id, text, delay_ms).await
+    type_text_into_active_context(client, session_id, text, delay_ms, human_seed).await
 }
 
+/// Shortest pause after each human-paced keystroke, and the seeded spread
+/// added on top, so text appears at roughly 13 characters per second.
+const HUMAN_KEY_DELAY_MS: u64 = 65;
+const HUMAN_KEY_JITTER_MS: u64 = 25;
+
+/// Pause after the `index`th human-paced keystroke. Varied deterministically
+/// by `seed`, like the human mouse path, so a rerun types identically.
+pub fn human_key_delay_ms(seed: u64, index: usize) -> u64 {
+    let mixed = (seed ^ (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    HUMAN_KEY_DELAY_MS + (mixed >> 33) % (HUMAN_KEY_JITTER_MS + 1)
+}
+
+/// `human_seed` replaces the fixed `delay_ms` with a human-paced one per key.
 pub async fn type_text_into_active_context(
     client: &CdpClient,
     session_id: &str,
     text: &str,
     delay_ms: Option<u64>,
+    human_seed: Option<u64>,
 ) -> Result<(), String> {
     let delay = delay_ms.unwrap_or(0);
 
-    for ch in text.chars() {
+    for (index, ch) in text.chars().enumerate() {
         if matches!(ch, '\n' | '\r' | '\t') {
             let (key, code, key_code) = char_to_key_info(ch);
             let text_str = key_text(&key);
@@ -311,8 +335,9 @@ pub async fn type_text_into_active_context(
                 .await?;
         }
 
-        if delay > 0 {
-            tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
+        let pause = human_seed.map_or(delay, |seed| human_key_delay_ms(seed, index));
+        if pause > 0 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(pause)).await;
         }
     }
 
@@ -1386,5 +1411,26 @@ mod tests {
         assert_eq!(key_text("ArrowUp"), None);
         assert_eq!(key_text("Backspace"), None);
         assert_eq!(key_text("Delete"), None);
+    }
+
+    #[test]
+    fn test_human_key_delay_is_bounded_varied_and_reproducible() {
+        let delays: Vec<u64> = (0..200).map(|i| human_key_delay_ms(7, i)).collect();
+        assert!(delays
+            .iter()
+            .all(|d| (HUMAN_KEY_DELAY_MS..=HUMAN_KEY_DELAY_MS + HUMAN_KEY_JITTER_MS).contains(d)));
+        assert!(
+            delays.iter().any(|d| *d != delays[0]),
+            "keystrokes should not tick evenly"
+        );
+        assert_eq!(human_key_delay_ms(7, 3), delays[3]);
+        assert_ne!(
+            (0..20)
+                .map(|i| human_key_delay_ms(1, i))
+                .collect::<Vec<_>>(),
+            (0..20)
+                .map(|i| human_key_delay_ms(2, i))
+                .collect::<Vec<_>>()
+        );
     }
 }

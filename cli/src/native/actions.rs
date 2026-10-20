@@ -1184,6 +1184,7 @@ impl DaemonState {
                 return Err(format!("Failed to install recording cursor: {error}"));
             }
         }
+        self.recording_state.started_at = Some(std::time::Instant::now());
         let handle = recording::spawn_recording_task(
             client,
             capture_session,
@@ -1212,6 +1213,7 @@ impl DaemonState {
     /// Reconcile every externally visible recording flag after startup fails.
     async fn rollback_failed_recording_start(&mut self) {
         self.recording_state.active = false;
+        self.recording_state.action_log = None;
         if let Some(ref server) = self.stream_server {
             server.set_recording(false, &self.engine).await;
         }
@@ -2633,6 +2635,85 @@ fn should_validate_restore_after_action(action: &str) -> bool {
     action != "launch"
 }
 
+/// Command fields copied into a `--log-actions` entry. Everything else on the
+/// command (ids, plugins, restore and session settings) is transport detail.
+const ACTION_LOG_ARGS: &[&str] = &[
+    "url",
+    "selector",
+    "value",
+    "values",
+    "text",
+    "key",
+    "role",
+    "name",
+    "label",
+    "placeholder",
+    "testId",
+    "index",
+    "exact",
+    "direction",
+    "amount",
+    "x",
+    "y",
+];
+
+/// Append a finished user action to the recording's `--log-actions` timeline.
+/// `tsMs` marks completion in ms since the video's first frame, so the action
+/// spans `[tsMs - durationMs, tsMs]` of the video. `find` locators are logged
+/// as the action they performed, with the locator under `args.via`.
+fn log_recorded_action(
+    state: &mut DaemonState,
+    action: &str,
+    cmd: &Value,
+    result: &Result<Value, String>,
+    started: std::time::Instant,
+    pointer_before: (f64, f64),
+) {
+    let recording = &mut state.recording_state;
+    let (true, Some(log), Some(video_start)) = (
+        recording.active,
+        recording.action_log.as_mut(),
+        recording.started_at,
+    ) else {
+        return;
+    };
+    let name = match action {
+        "navigate" | "click" | "dblclick" | "fill" | "type" | "press" | "hover" | "scroll"
+        | "select" | "check" | "uncheck" => action,
+        _ if action.starts_with("getby") || action == "nth" => cmd
+            .get("subaction")
+            .and_then(Value::as_str)
+            .unwrap_or("click"),
+        _ => return,
+    };
+
+    let mut args: serde_json::Map<String, Value> = ACTION_LOG_ARGS
+        .iter()
+        .filter_map(|key| cmd.get(*key).map(|v| (key.to_string(), v.clone())))
+        .collect();
+    if name != action {
+        args.insert("via".to_string(), json!(action));
+    }
+    let ts_ms = video_start.elapsed().as_millis() as u64;
+    let mut entry = json!({
+        "action": name,
+        "args": args,
+        "tsMs": ts_ms,
+        "durationMs": started.elapsed().as_millis() as u64,
+        // Frames are paced against wall clock, so time maps straight to index.
+        "frameIdx": ts_ms * u64::from(recording.fps) / 1000,
+        "ok": result.is_ok(),
+    });
+    let pointer = (state.mouse_state.x, state.mouse_state.y);
+    if pointer != pointer_before {
+        entry["target"] = json!({ "x": pointer.0.round() as i64, "y": pointer.1.round() as i64 });
+    }
+    if let Err(error) = result {
+        entry["error"] = json!(error);
+    }
+    log.append(&entry);
+}
+
 fn policy_actions_for_command(
     cmd: &Value,
     action: &str,
@@ -3007,6 +3088,8 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         }
     }
 
+    let action_started = std::time::Instant::now();
+    let pointer_before = (state.mouse_state.x, state.mouse_state.y);
     let result = match action {
         "launch" => {
             let webmcp_enabled = cmd
@@ -3189,6 +3272,7 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         "mouseup" => handle_mouseup(cmd, state).await,
         _ => Err(format!("Not yet implemented: {}", action)),
     };
+    log_recorded_action(state, action, cmd, &result, action_started, pointer_before);
 
     if result.is_ok() && should_validate_restore_after_action(action) {
         validate_restore_if_pending(state).await;
@@ -6208,6 +6292,74 @@ fn record_click_animation(
     }
 }
 
+/// Unless input mode is instant, glide the pointer to the element's center
+/// before acting on it, so pointer-path handlers fire and recordings show the
+/// approach. Human mode bends the path; smooth mode moves straight in 200ms.
+async fn approach_element(
+    cmd: &Value,
+    state: &mut DaemonState,
+    selector: &str,
+) -> Result<(), String> {
+    let input_mode = cmd
+        .get("inputMode")
+        .and_then(Value::as_str)
+        .unwrap_or(&state.input_mode);
+    if input_mode == "instant" {
+        return Ok(());
+    }
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let session_id = mgr.active_session_id()?.to_string();
+    let (x, y, target_session_id) = super::element::resolve_element_center(
+        &mgr.client,
+        &session_id,
+        &state.ref_map,
+        selector,
+        &state.iframe_sessions,
+    )
+    .await?;
+    let offset = super::element::session_viewport_offset(
+        &mgr.client,
+        &session_id,
+        &target_session_id,
+        &state.iframe_sessions,
+    )
+    .await?;
+    move_mouse_interpolated(
+        &mgr.client,
+        &target_session_id,
+        &mut state.mouse_state,
+        x,
+        y,
+        if input_mode == "smooth" { 200 } else { 0 },
+        None,
+        input_mode == "human",
+        cmd.get("seed").and_then(Value::as_u64).unwrap_or(0),
+        0,
+        offset,
+        &state.recording_state.shared_cursor,
+    )
+    .await
+}
+
+/// The `--seed` that varies human pacing, or `None` outside human input mode.
+fn human_input_seed(cmd: &Value, state: &DaemonState) -> Option<u64> {
+    let input_mode = cmd
+        .get("inputMode")
+        .and_then(Value::as_str)
+        .unwrap_or(&state.input_mode);
+    (input_mode == "human").then(|| cmd.get("seed").and_then(Value::as_u64).unwrap_or(0))
+}
+
+/// How long human mode holds still after a click, so a recording shows each
+/// click land before the pointer heads for the next target.
+const HUMAN_CLICK_DWELL: std::time::Duration = std::time::Duration::from_millis(250);
+
+async fn human_click_dwell(cmd: &Value, state: &DaemonState) {
+    if human_input_seed(cmd, state).is_some() {
+        tokio::time::sleep(HUMAN_CLICK_DWELL).await;
+    }
+}
+
 async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
     let selector = cmd
         .get("selector")
@@ -6300,43 +6452,8 @@ async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
     let button = cmd.get("button").and_then(|v| v.as_str()).unwrap_or("left");
     let click_count = cmd.get("clickCount").and_then(|v| v.as_i64()).unwrap_or(1) as i32;
 
-    let input_mode = cmd
-        .get("inputMode")
-        .and_then(Value::as_str)
-        .unwrap_or(&state.input_mode);
-    if input_mode != "instant" {
-        let (x, y, target_session_id) = super::element::resolve_element_center(
-            &mgr.client,
-            &session_id,
-            &state.ref_map,
-            selector,
-            &state.iframe_sessions,
-        )
-        .await?;
-        let offset = super::element::session_viewport_offset(
-            &mgr.client,
-            &session_id,
-            &target_session_id,
-            &state.iframe_sessions,
-        )
-        .await?;
-        move_mouse_interpolated(
-            &mgr.client,
-            &target_session_id,
-            &mut state.mouse_state,
-            x,
-            y,
-            if input_mode == "smooth" { 200 } else { 0 },
-            None,
-            input_mode == "human",
-            cmd.get("seed").and_then(Value::as_u64).unwrap_or(0),
-            0,
-            offset,
-            &state.recording_state.shared_cursor,
-        )
-        .await?;
-    }
-
+    approach_element(cmd, state, selector).await?;
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let result = interaction::click(
         &mgr.client,
         &session_id,
@@ -6352,6 +6469,7 @@ async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
         &mut state.mouse_state,
         &state.recording_state.shared_cursor,
     );
+    human_click_dwell(cmd, state).await;
 
     if result.dialog_opened {
         state.pending_pointer_release = result.pending_release;
@@ -6361,12 +6479,13 @@ async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
 }
 
 async fn handle_dblclick(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
     let selector = cmd
         .get("selector")
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
+    approach_element(cmd, state, selector).await?;
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let session_id = mgr.active_session_id()?.to_string();
 
     let result = interaction::dblclick(
         &mgr.client,
@@ -6405,6 +6524,9 @@ async fn handle_fill(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
         }
     }
 
+    // The approach is cosmetic here: fill focuses through the DOM, so an
+    // element without a box (e.g. a visually hidden input) must still fill.
+    let _ = approach_element(cmd, state, selector).await;
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
 
@@ -6415,14 +6537,13 @@ async fn handle_fill(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
         selector,
         value,
         &state.iframe_sessions,
+        human_input_seed(cmd, state),
     )
     .await?;
     Ok(json!({ "filled": selector }))
 }
 
 async fn handle_type(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
     let selector = cmd
         .get("selector")
         .and_then(|v| v.as_str())
@@ -6434,6 +6555,11 @@ async fn handle_type(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
     let clear = cmd.get("clear").and_then(|v| v.as_bool()).unwrap_or(false);
     let delay = cmd.get("delay").and_then(|v| v.as_u64());
 
+    // Cosmetic, as in handle_fill.
+    let _ = approach_element(cmd, state, selector).await;
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let session_id = mgr.active_session_id()?.to_string();
+
     interaction::type_text(
         &mgr.client,
         &session_id,
@@ -6443,6 +6569,8 @@ async fn handle_type(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
         clear,
         delay,
         &state.iframe_sessions,
+        // An explicit --delay keeps its fixed pacing.
+        human_input_seed(cmd, state).filter(|_| delay.is_none()),
     )
     .await?;
     Ok(json!({ "typed": text }))
@@ -6504,12 +6632,13 @@ fn parse_key_chord(input: &str) -> (String, Option<i32>) {
 }
 
 async fn handle_hover(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
     let selector = cmd
         .get("selector")
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
+    approach_element(cmd, state, selector).await?;
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let session_id = mgr.active_session_id()?.to_string();
 
     let position = interaction::hover(
         &mgr.client,
@@ -6561,12 +6690,14 @@ async fn handle_scroll(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
 }
 
 async fn handle_select(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
     let selector = cmd
         .get("selector")
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
+    // Cosmetic, as in handle_fill.
+    let _ = approach_element(cmd, state, selector).await;
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let session_id = mgr.active_session_id()?.to_string();
 
     let values: Vec<String> = match cmd.get("values") {
         Some(Value::Array(arr)) => arr
@@ -6594,12 +6725,14 @@ async fn handle_select(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
 }
 
 async fn handle_check(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
     let selector = cmd
         .get("selector")
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
+    // Cosmetic: a styled checkbox can hide its input, which still toggles.
+    let _ = approach_element(cmd, state, selector).await;
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let session_id = mgr.active_session_id()?.to_string();
 
     if let Some(position) = interaction::check(
         &mgr.client,
@@ -6619,12 +6752,14 @@ async fn handle_check(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
 }
 
 async fn handle_uncheck(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
     let selector = cmd
         .get("selector")
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
+    // Cosmetic: a styled checkbox can hide its input, which still toggles.
+    let _ = approach_element(cmd, state, selector).await;
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let session_id = mgr.active_session_id()?.to_string();
 
     if let Some(position) = interaction::uncheck(
         &mgr.client,
@@ -6647,6 +6782,11 @@ async fn handle_wait(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let timeout_ms = state.timeout_ms(cmd);
+
+    if let Some(stable_ms) = cmd.get("stable").and_then(|v| v.as_u64()) {
+        wait_for_dom_stable(&mgr.client, &session_id, stable_ms, timeout_ms).await?;
+        return Ok(json!({ "waited": "stable", "ms": stable_ms }));
+    }
 
     if let Some(text) = cmd.get("text").and_then(|v| v.as_str()) {
         wait_for_text(&mgr.client, &session_id, text, timeout_ms).await?;
@@ -6970,6 +7110,32 @@ async fn wait_for_function(
     timeout_ms: u64,
 ) -> Result<(), String> {
     let check_fn = format!("!!({})", fn_str);
+    poll_until_true(client, session_id, &check_fn, timeout_ms).await
+}
+
+/// Resolves once a `MutationObserver` on `document` has seen no mutations for
+/// `stable_ms`. The observer is installed by the first poll and removed once
+/// the DOM settles; a navigation drops it with the old document.
+async fn wait_for_dom_stable(
+    client: &super::cdp::client::CdpClient,
+    session_id: &str,
+    stable_ms: u64,
+    timeout_ms: u64,
+) -> Result<(), String> {
+    let check_fn = format!(
+        r#"(() => {{
+            let s = window.__agentBrowserStable;
+            if (!s) {{
+                s = window.__agentBrowserStable = {{ last: performance.now() }};
+                s.observer = new MutationObserver(() => {{ s.last = performance.now(); }});
+                s.observer.observe(document, {{ subtree: true, childList: true, attributes: true, characterData: true }});
+            }}
+            if (performance.now() - s.last < {stable_ms}) return false;
+            s.observer.disconnect();
+            delete window.__agentBrowserStable;
+            return true;
+        }})()"#
+    );
     poll_until_true(client, session_id, &check_fn, timeout_ms).await
 }
 
@@ -7515,8 +7681,14 @@ async fn handle_keyboard(cmd: &Value, state: &DaemonState) -> Result<Value, Stri
                 .get("text")
                 .and_then(|v| v.as_str())
                 .ok_or("Missing 'text' parameter")?;
-            interaction::type_text_into_active_context(&mgr.client, &session_id, text, None)
-                .await?;
+            interaction::type_text_into_active_context(
+                &mgr.client,
+                &session_id,
+                text,
+                None,
+                human_input_seed(cmd, state),
+            )
+            .await?;
             return Ok(json!({ "typed": text }));
         }
         Some("insertText") => {
@@ -8013,6 +8185,16 @@ fn recording_options_from_command(cmd: &Value) -> Result<recording::RecordingOpt
     })
 }
 
+/// Open the `--log-actions` file before any browser work, so a bad path fails
+/// the command without touching the page or an in-flight take.
+fn recording_action_log_from_command(cmd: &Value) -> Result<Option<recording::ActionLog>, String> {
+    cmd.get("logActions")
+        .and_then(Value::as_str)
+        .filter(|path| !path.is_empty())
+        .map(recording::ActionLog::open)
+        .transpose()
+}
+
 /// Start recording the current active page. The recorder attaches to the
 /// active session as-is: no new browser context, no new tab, and no
 /// navigation unless a URL is given (in which case the active tab navigates
@@ -8039,6 +8221,7 @@ async fn handle_recording_start(cmd: &Value, state: &mut DaemonState) -> Result<
     // costs nothing.
     let options = recording_options_from_command(cmd)?;
     recording::validate_output_path(path)?;
+    let action_log = recording_action_log_from_command(cmd)?;
 
     {
         let domain_filter = state.domain_filter.read().await;
@@ -8067,6 +8250,7 @@ async fn handle_recording_start(cmd: &Value, state: &mut DaemonState) -> Result<
     };
 
     let result = recording::recording_start(&mut state.recording_state, path, options)?;
+    state.recording_state.action_log = action_log;
     state.start_recording_task(client, session_id).await?;
 
     if let Some(ref server) = state.stream_server {
@@ -8104,6 +8288,7 @@ async fn handle_recording_restart(cmd: &Value, state: &mut DaemonState) -> Resul
     // Validate the path and rate before stopping the in-flight take.
     recording::validate_output_path(path)?;
     let options = recording_options_from_command(cmd)?;
+    let action_log = recording_action_log_from_command(cmd)?;
 
     {
         let domain_filter = state.domain_filter.read().await;
@@ -8141,6 +8326,7 @@ async fn handle_recording_restart(cmd: &Value, state: &mut DaemonState) -> Resul
     };
 
     recording::recording_start(&mut state.recording_state, path, options)?;
+    state.recording_state.action_log = action_log;
 
     if let Some((client, session_id)) = recording_target {
         state.start_recording_task(client, session_id).await?;
@@ -10038,6 +10224,14 @@ async fn execute_subaction(
         ));
     }
 
+    match subaction {
+        "click" | "hover" => approach_element(cmd, state, selector).await?,
+        // Cosmetic, as in handle_fill.
+        "fill" | "check" => {
+            let _ = approach_element(cmd, state, selector).await;
+        }
+        _ => {}
+    }
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
 
@@ -10058,6 +10252,7 @@ async fn execute_subaction(
                 &mut state.mouse_state,
                 &state.recording_state.shared_cursor,
             );
+            human_click_dwell(cmd, state).await;
             if result.dialog_opened {
                 state.pending_pointer_release = result.pending_release;
                 return Ok(json!({ "clicked": selector, "dialogOpened": true }));
@@ -10076,6 +10271,7 @@ async fn execute_subaction(
                 selector,
                 value,
                 &state.iframe_sessions,
+                human_input_seed(cmd, state),
             )
             .await?;
             Ok(json!({ "filled": selector }))
@@ -10353,16 +10549,34 @@ async fn handle_getbyrole(cmd: &Value, state: &mut DaemonState) -> Result<Value,
         &state.iframe_sessions,
     );
 
-    let ax_tree: GetFullAXTreeResult = mgr
-        .client
-        .send_command_typed(
-            "Accessibility.getFullAXTree",
-            &ax_params,
-            Some(effective_session_id),
-        )
-        .await?;
-
-    let (backend_node_id, actual_name) = find_ax_node_by_role(&ax_tree.nodes, role, name, exact)?;
+    let allow_ambiguous = cmd
+        .get("allowAmbiguous")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut matches = Vec::new();
+    for attempt in 0..2 {
+        if attempt > 0 {
+            // Hydrating SSR pages briefly render duplicate controls; give the
+            // page a couple of frames before calling the query ambiguous.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let ax_tree: GetFullAXTreeResult = mgr
+            .client
+            .send_command_typed(
+                "Accessibility.getFullAXTree",
+                &ax_params,
+                Some(effective_session_id),
+            )
+            .await?;
+        matches = find_ax_node_by_role(&ax_tree.nodes, role, name, exact)?;
+        if matches.len() == 1 || allow_ambiguous {
+            break;
+        }
+    }
+    if matches.len() > 1 && !allow_ambiguous {
+        return Err(ambiguous_role_error(role, name, exact, &matches));
+    }
+    let (backend_node_id, actual_name) = matches.swap_remove(0);
 
     let ref_num = state.ref_map.next_ref_num();
     let temp_ref = format!("e{}", ref_num);
@@ -10379,6 +10593,28 @@ async fn handle_getbyrole(cmd: &Value, state: &mut DaemonState) -> Result<Value,
     let result = execute_subaction(cmd, state, &format!("@{}", temp_ref)).await;
     state.ref_map.remove(&temp_ref);
     result
+}
+
+/// Name every candidate so the agent can tighten the query instead of
+/// guessing a position with `find nth`.
+fn ambiguous_role_error(
+    role: &str,
+    name: Option<&str>,
+    exact: bool,
+    matches: &[(i64, String)],
+) -> String {
+    let shown: Vec<String> = matches
+        .iter()
+        .take(5)
+        .map(|(_, n)| format!("\"{}\"", n))
+        .collect();
+    let more = if matches.len() > 5 { ", ..." } else { "" };
+    format!(
+        "Ambiguous role match: {desc} matched {count} elements: {shown}{more}. Try `--exact`, a more specific `--name`, a CSS attribute selector (e.g. `click 'form button[type=\"submit\"]'`), or a snapshot ref (`snapshot -i`, then `click @eN`). Pass `--allow-ambiguous` to use the first match.",
+        desc = build_role_selector(role, name, exact),
+        count = matches.len(),
+        shown = shown.join(", "),
+    )
 }
 
 /// Map a Chrome AX tree role to its ARIA name. Divergences: `image` -> `img`
@@ -10406,15 +10642,17 @@ fn normalize_ws(s: &str) -> String {
 /// Playwright's getByRole semantics: role values are compared case-insensitively
 /// after AX-to-ARIA normalization; accessible names are whitespace-normalized on
 /// both sides, then non-exact matching is a case-insensitive substring check and
-/// exact matching is a case-sensitive whole-name comparison. Continues past AX
-/// nodes without a backendDOMNodeId (virtual nodes) so a later actionable match
-/// still wins.
+/// exact matching is a case-sensitive whole-name comparison. Returns every
+/// actionable match (one per DOM node, in tree order) so the caller can refuse
+/// an ambiguous query; AX nodes without a backendDOMNodeId (virtual nodes) are
+/// skipped.
 fn find_ax_node_by_role(
     nodes: &[super::cdp::types::AXNode],
     role: &str,
     name: Option<&str>,
     exact: bool,
-) -> Result<(i64, String), String> {
+) -> Result<Vec<(i64, String)>, String> {
+    let mut found: Vec<(i64, String)> = Vec::new();
     let mut matched_without_backend_id = false;
     // `names_seen` keeps first-seen order for the error message; `names_set` makes
     // the dedup check O(1) so a failed name query is linear, not quadratic, in the
@@ -10453,11 +10691,15 @@ fn find_ax_node_by_role(
             continue;
         }
 
-        if let Some(id) = node.backend_d_o_m_node_id {
-            return Ok((id, node_name));
+        match node.backend_d_o_m_node_id {
+            Some(id) if found.iter().all(|(seen, _)| *seen != id) => found.push((id, node_name)),
+            Some(_) => {}
+            None => matched_without_backend_id = true,
         }
+    }
 
-        matched_without_backend_id = true;
+    if !found.is_empty() {
+        return Ok(found);
     }
 
     if matched_without_backend_id {
@@ -10519,6 +10761,39 @@ async fn handle_semantic_locator(
         .and_then(|v| v.as_str())
         .ok_or(format!("Missing '{}' parameter", param_name))?;
     let exact = cmd.get("exact").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    // For "text" strategy, support interactive-element preference + multi-match
+    // surfacing so click-on-ambiguous-text fails loudly instead of silently
+    // picking the first DOM-order leaf.
+    if strategy == "text" {
+        let subaction = cmd
+            .get("subaction")
+            .and_then(|v| v.as_str())
+            .unwrap_or("click");
+        let is_click_like = matches!(subaction, "click" | "dblclick" | "hover" | "tap");
+        let prefer_interactive = cmd
+            .get("preferInteractive")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(is_click_like);
+        let allow_ambiguous = cmd
+            .get("allowAmbiguous")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let include_hidden = cmd
+            .get("includeHidden")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        return locate_text_with_disambiguation(
+            cmd,
+            state,
+            value,
+            exact,
+            prefer_interactive,
+            allow_ambiguous,
+            include_hidden,
+        )
+        .await;
+    }
 
     let match_fn = if exact {
         format!(
@@ -10636,6 +10911,200 @@ async fn handle_semantic_locator(
         .unwrap_or(false)
     {
         return Err(format!("No element found by {} '{}'", strategy, value));
+    }
+
+    let selector = "[data-agent-browser-located='true']";
+    let action_result = execute_subaction(cmd, state, selector).await;
+
+    if let Some(ref browser) = state.browser {
+        let _ = browser
+            .evaluate(
+                "document.querySelector('[data-agent-browser-located]')?.removeAttribute('data-agent-browser-located')",
+                None,
+            )
+            .await;
+    }
+
+    action_result
+}
+
+/// Selector covering the elements we treat as "interactive" when scoring
+/// candidates for `find text`. Mirrors the Playwright/aria heuristic — anything
+/// the user can plausibly click, focus, or activate.
+const INTERACTIVE_CSS_SELECTOR: &str = "a, button, [role=button], [role=link], input[type=submit], input[type=button], [onclick], [role=menuitem], [role=tab], [tabindex]:not([tabindex=\"-1\"])";
+
+/// JS helper that filters out invisible / aria-hidden / zero-rect candidates so
+/// SSR-hydration ghosts and hidden mobile-menu duplicates don't trigger
+/// spurious ambiguity errors. Inlined into the disambiguation IIFEs at use.
+const VISIBILITY_HELPER_JS: &str = r#"
+const isInteractable = (el) => {
+    if (!(el instanceof Element)) return false;
+    if (typeof el.checkVisibility === "function") {
+        if (!el.checkVisibility({ contentVisibilityAuto: true, visibilityProperty: true })) return false;
+    } else if (el.offsetParent === null && getComputedStyle(el).position !== "fixed") {
+        return false;
+    }
+    if (el.closest('[aria-hidden="true"], [hidden], [inert]')) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) return false;
+    return true;
+};
+"#;
+
+#[derive(Debug, serde::Deserialize)]
+struct LeafPreview {
+    tag: String,
+    role: String,
+    name: String,
+    html: String,
+    interactive: bool,
+    #[serde(default = "default_visible")]
+    visible: bool,
+}
+
+fn default_visible() -> bool {
+    true
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct LocateResult {
+    count: u64,
+    matches: Vec<LeafPreview>,
+    #[serde(default, rename = "hiddenCount")]
+    hidden_count: u64,
+}
+
+/// Locate a leaf by visible text with interactive-anchor preference and
+/// multi-match disambiguation. Replaces the original "first leaf wins"
+/// behaviour that silently mis-clicked when the same text appeared on a link
+/// and a nested button (or in headings + buttons).
+async fn locate_text_with_disambiguation(
+    cmd: &Value,
+    state: &mut DaemonState,
+    value: &str,
+    exact: bool,
+    prefer_interactive: bool,
+    allow_ambiguous: bool,
+    include_hidden: bool,
+) -> Result<Value, String> {
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let session_id = mgr.active_session_id()?.to_string();
+
+    let value_json = serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string());
+    let interactive_sel_json =
+        serde_json::to_string(INTERACTIVE_CSS_SELECTOR).unwrap_or_else(|_| "\"\"".to_string());
+    let match_expr = if exact {
+        format!("el.textContent.trim() === {}", value_json)
+    } else {
+        format!("el.textContent.includes({})", value_json)
+    };
+
+    let js = format!(
+        r#"(async () => {{
+            {visibility_helper}
+            const INTERACTIVE_SEL = {interactive_sel};
+            const run = () => {{
+                const allLeaves = Array.from(document.querySelectorAll('*'))
+                    .filter(el => el.children.length === 0 && {match_expr});
+                const scored = allLeaves.map(el => {{
+                    const interactive = el.closest(INTERACTIVE_SEL);
+                    return {{ anchor: interactive || el, isInteractive: !!interactive }};
+                }});
+                const preferred = ({prefer_interactive} && scored.some(s => s.isInteractive))
+                    ? scored.filter(s => s.isInteractive)
+                    : scored;
+                const seen = new Set();
+                const allAnchors = [];
+                for (const s of preferred) {{
+                    if (!seen.has(s.anchor)) {{ seen.add(s.anchor); allAnchors.push(s.anchor); }}
+                }}
+                const candidates = {include_hidden} ? allAnchors : allAnchors.filter(isInteractable);
+                const hiddenCount = allAnchors.length - candidates.length;
+                const matches = candidates.slice(0, 5).map(el => ({{
+                    tag: el.tagName.toLowerCase(),
+                    role: el.getAttribute('role') || '',
+                    name: (el.getAttribute('aria-label') || el.textContent || '').trim().slice(0, 60),
+                    html: el.outerHTML.slice(0, 200),
+                    interactive: el.matches(INTERACTIVE_SEL),
+                    visible: isInteractable(el),
+                }}));
+                return {{ candidates, count: candidates.length, hiddenCount, matches }};
+            }};
+            let r = run();
+            if (r.count > 1) {{
+                await new Promise((res) => requestAnimationFrame(() => requestAnimationFrame(res)));
+                r = run();
+            }}
+            if (r.count === 1 || (r.count > 0 && {allow_ambiguous})) {{
+                r.candidates[0].setAttribute('data-agent-browser-located', 'true');
+            }}
+            return {{ count: r.count, hiddenCount: r.hiddenCount, matches: r.matches }};
+        }})()"#,
+        visibility_helper = VISIBILITY_HELPER_JS,
+        interactive_sel = interactive_sel_json,
+        match_expr = match_expr,
+        prefer_interactive = prefer_interactive,
+        allow_ambiguous = allow_ambiguous,
+        include_hidden = include_hidden,
+    );
+
+    let result: super::cdp::types::EvaluateResult = mgr
+        .client
+        .send_command_typed(
+            "Runtime.evaluate",
+            &super::cdp::types::EvaluateParams {
+                expression: js,
+                return_by_value: Some(true),
+                await_promise: Some(true),
+            },
+            Some(&session_id),
+        )
+        .await?;
+
+    let raw = result
+        .result
+        .value
+        .ok_or_else(|| "find text: empty CDP evaluation result".to_string())?;
+    let parsed: LocateResult = serde_json::from_value(raw)
+        .map_err(|e| format!("find text: invalid CDP evaluation result: {}", e))?;
+
+    if parsed.count == 0 {
+        if parsed.hidden_count > 0 {
+            return Err(format!(
+                "No visible element found by text '{}'. Found {} hidden matches (display:none / aria-hidden / zero-rect). Pass --include-hidden to match them anyway.",
+                value, parsed.hidden_count
+            ));
+        }
+        return Err(format!("No element found by text '{}'", value));
+    }
+
+    if parsed.count > 1 && !allow_ambiguous {
+        let mut detail = String::new();
+        for (i, m) in parsed.matches.iter().enumerate() {
+            detail.push_str(&format!(
+                "\n  [{}] <{}{}{}{}> {} — {}",
+                i,
+                m.tag,
+                if m.role.is_empty() {
+                    String::new()
+                } else {
+                    format!(" role=\"{}\"", m.role)
+                },
+                if m.interactive { " (interactive)" } else { "" },
+                if m.visible { "" } else { " hidden" },
+                if m.name.is_empty() {
+                    "(no name)".to_string()
+                } else {
+                    format!("\"{}\"", m.name)
+                },
+                m.html,
+            ));
+        }
+        return Err(format!(
+            "Ambiguous text match: '{val}' matched {n} elements:{detail}\nTry: `--exact`, `find role <role> click --name \"{val}\" --exact`, a CSS attribute selector (e.g. `click 'form button[type=\"submit\"]'`), or a snapshot ref (`agent-browser snapshot -i` then `click @eN`). Pass `--allow-ambiguous` to accept the first match.",
+            val = value,
+            n = parsed.count,
+        ));
     }
 
     let selector = "[data-agent-browser-located='true']";
@@ -14145,6 +14614,42 @@ mod tests {
         assert_eq!(normalize_ax_role("document"), "document");
     }
 
+    /// The first actionable match, which is what a non-ambiguous query acts on.
+    fn first_role_match(
+        nodes: &[AXNode],
+        role: &str,
+        name: Option<&str>,
+        exact: bool,
+    ) -> Result<(i64, String), String> {
+        find_ax_node_by_role(nodes, role, name, exact).map(|matches| matches[0].clone())
+    }
+
+    #[test]
+    fn find_ax_node_by_role_returns_every_match_once() {
+        let nodes = vec![
+            ax_node("button", "Login", Some(10), false),
+            ax_node("button", "Login with Google", Some(11), false),
+            ax_node("button", "Login", Some(10), false),
+            ax_node("button", "Login", Some(12), true),
+        ];
+
+        let matches = find_ax_node_by_role(&nodes, "button", Some("login"), false).unwrap();
+        assert_eq!(
+            matches,
+            [
+                (10, "Login".to_string()),
+                (11, "Login with Google".to_string())
+            ]
+        );
+        let exact = find_ax_node_by_role(&nodes, "button", Some("Login"), true).unwrap();
+        assert_eq!(exact, [(10, "Login".to_string())]);
+
+        let err = ambiguous_role_error("button", Some("login"), false, &matches);
+        assert!(err.starts_with("Ambiguous role match"), "{err}");
+        assert!(err.contains("\"Login with Google\""), "{err}");
+        assert!(err.contains("--allow-ambiguous"), "{err}");
+    }
+
     #[test]
     fn find_ax_node_by_role_matches_browser_computed_implicit_roles() {
         let nodes = vec![
@@ -14153,13 +14658,12 @@ mod tests {
             ax_node("heading", "Skills", Some(43), false),
         ];
 
-        let (backend_id, actual_name) =
-            find_ax_node_by_role(&nodes, "link", Some("Services"), true)
-                .expect("computed AX link role should match the anchor");
+        let (backend_id, actual_name) = first_role_match(&nodes, "link", Some("Services"), true)
+            .expect("computed AX link role should match the anchor");
         assert_eq!(backend_id, 42);
         assert_eq!(actual_name, "Services");
 
-        let (backend_id, _) = find_ax_node_by_role(&nodes, "heading", None, false)
+        let (backend_id, _) = first_role_match(&nodes, "heading", None, false)
             .expect("role-only lookup should match the implicit heading");
         assert_eq!(backend_id, 43);
     }
@@ -14169,10 +14673,8 @@ mod tests {
         let nodes = vec![ax_node("heading", "SKILLS", Some(43), false)];
 
         for query in ["Skills", "skills", "SKILLS", "kill"] {
-            let (backend_id, actual_name) =
-                find_ax_node_by_role(&nodes, "heading", Some(query), false).unwrap_or_else(|e| {
-                    panic!("expected case-insensitive match for {query:?}: {e}")
-                });
+            let (backend_id, actual_name) = first_role_match(&nodes, "heading", Some(query), false)
+                .unwrap_or_else(|e| panic!("expected case-insensitive match for {query:?}: {e}"));
             assert_eq!(backend_id, 43);
             assert_eq!(actual_name, "SKILLS");
         }
@@ -14182,11 +14684,11 @@ mod tests {
     fn find_ax_node_by_role_exact_name_stays_case_sensitive() {
         let nodes = vec![ax_node("heading", "SKILLS", Some(43), false)];
 
-        let err = find_ax_node_by_role(&nodes, "heading", Some("Skills"), true)
+        let err = first_role_match(&nodes, "heading", Some("Skills"), true)
             .expect_err("exact matching must not ignore case");
         assert!(err.contains("Names seen: \"SKILLS\""));
 
-        let (backend_id, _) = find_ax_node_by_role(&nodes, "heading", Some("SKILLS"), true)
+        let (backend_id, _) = first_role_match(&nodes, "heading", Some("SKILLS"), true)
             .expect("exact match with identical case should still succeed");
         assert_eq!(backend_id, 43);
     }
@@ -14195,7 +14697,7 @@ mod tests {
     fn find_ax_node_by_role_matches_role_case_insensitively() {
         let nodes = vec![ax_node("heading", "Skills", Some(43), false)];
 
-        let (backend_id, _) = find_ax_node_by_role(&nodes, "Heading", None, false)
+        let (backend_id, _) = first_role_match(&nodes, "Heading", None, false)
             .expect("role matching should ignore case, same as name matching");
         assert_eq!(backend_id, 43);
     }
@@ -14206,11 +14708,11 @@ mod tests {
     fn find_ax_node_by_role_normalizes_ax_role_synonyms() {
         let nodes = vec![ax_node("image", "Logo", Some(51), false)];
 
-        let (backend_id, _) = find_ax_node_by_role(&nodes, "img", Some("Logo"), false)
+        let (backend_id, _) = first_role_match(&nodes, "img", Some("Logo"), false)
             .expect("the ARIA role name must match Chrome's AX role");
         assert_eq!(backend_id, 51);
 
-        let (backend_id, _) = find_ax_node_by_role(&nodes, "image", Some("Logo"), false)
+        let (backend_id, _) = first_role_match(&nodes, "image", Some("Logo"), false)
             .expect("the AX spelling keeps matching after normalization");
         assert_eq!(backend_id, 51);
     }
@@ -14221,11 +14723,11 @@ mod tests {
     fn find_ax_node_by_role_normalizes_whitespace_in_names() {
         let nodes = vec![ax_node("button", "Save   changes", Some(52), false)];
 
-        let (backend_id, _) = find_ax_node_by_role(&nodes, "button", Some("Save changes"), true)
+        let (backend_id, _) = first_role_match(&nodes, "button", Some("Save changes"), true)
             .expect("exact matching must normalize internal whitespace");
         assert_eq!(backend_id, 52);
 
-        let (backend_id, _) = find_ax_node_by_role(&nodes, "button", Some("save  changes"), false)
+        let (backend_id, _) = first_role_match(&nodes, "button", Some("save  changes"), false)
             .expect("substring matching must normalize internal whitespace");
         assert_eq!(backend_id, 52);
     }
@@ -14234,13 +14736,12 @@ mod tests {
     fn find_ax_node_by_role_supports_substring_matching() {
         let nodes = vec![ax_node("button", "Submit form", Some(7), false)];
 
-        let (backend_id, actual_name) =
-            find_ax_node_by_role(&nodes, "button", Some("submit"), false)
-                .expect("substring matching should be allowed without exact");
+        let (backend_id, actual_name) = first_role_match(&nodes, "button", Some("submit"), false)
+            .expect("substring matching should be allowed without exact");
         assert_eq!(backend_id, 7);
         assert_eq!(actual_name, "Submit form");
 
-        let err = find_ax_node_by_role(&nodes, "button", Some("Submit"), true)
+        let err = first_role_match(&nodes, "button", Some("Submit"), true)
             .expect_err("exact matching should reject partial names");
         assert!(err.contains("Names seen: \"Submit form\""));
     }
@@ -14252,7 +14753,7 @@ mod tests {
             ax_node("link", "Services", None, false),
         ];
 
-        let err = find_ax_node_by_role(&nodes, "link", Some("Services"), true)
+        let err = first_role_match(&nodes, "link", Some("Services"), true)
             .expect_err("matching AX nodes must have a backend DOM node id");
         assert!(err.contains("no live DOM element"));
     }
@@ -14264,9 +14765,8 @@ mod tests {
             ax_node("link", "Services", Some(42), false),
         ];
 
-        let (backend_id, actual_name) =
-            find_ax_node_by_role(&nodes, "link", Some("Services"), true)
-                .expect("lookup should continue past matching virtual AX nodes");
+        let (backend_id, actual_name) = first_role_match(&nodes, "link", Some("Services"), true)
+            .expect("lookup should continue past matching virtual AX nodes");
         assert_eq!(backend_id, 42);
         assert_eq!(actual_name, "Services");
     }
@@ -14278,7 +14778,7 @@ mod tests {
             ax_node("heading", "Experience", Some(44), false),
         ];
 
-        let err = find_ax_node_by_role(&nodes, "heading", Some("Nope"), false)
+        let err = first_role_match(&nodes, "heading", Some("Nope"), false)
             .expect_err("no node should match an unrelated name");
         assert!(err.contains("2 elements have role \"heading\""));
         assert!(err.contains("Nope"));
@@ -14294,7 +14794,7 @@ mod tests {
             ax_node("heading", "Skills", Some(45), false),
         ];
 
-        let err = find_ax_node_by_role(&nodes, "heading", Some("Nope"), false)
+        let err = first_role_match(&nodes, "heading", Some("Nope"), false)
             .expect_err("no node should match an unrelated name");
         // 3 elements share the same name, so names_seen dedupes to 1 entry;
         // the element count must still say 3, not 1.
@@ -14313,7 +14813,7 @@ mod tests {
     fn find_ax_node_by_role_no_role_match_reports_role_selector() {
         let nodes = vec![ax_node("button", "Submit", Some(7), false)];
 
-        let err = find_ax_node_by_role(&nodes, "heading", Some("Nope"), false)
+        let err = first_role_match(&nodes, "heading", Some("Nope"), false)
             .expect_err("no node has this role at all");
         assert!(err.contains("getByRole('heading'"));
         assert!(err.contains("Nope"));

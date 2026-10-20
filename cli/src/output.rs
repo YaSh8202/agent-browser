@@ -2130,6 +2130,7 @@ Modes:
   --load <state>       Wait for load state (load, domcontentloaded, networkidle)
   --fn <expression>    Wait for JavaScript expression to be truthy
   --text <text>        Wait for text to appear on page (substring match)
+  --stable <ms>        Wait until the DOM has gone <ms> without a mutation
   --download [path]    Wait for a download to complete (optionally save to path)
 
 Download Options (with --download):
@@ -2427,6 +2428,12 @@ Options:
   --exact              Exact, case-sensitive match. For role it applies to
                        the accessible name, whose default is a case-insensitive
                        substring. The role value itself always ignores case.
+  --allow-ambiguous    role/text: act on the first match instead of failing
+                       when several elements match
+  --include-hidden     text: also match hidden elements (role never does)
+  --no-prefer-interactive
+                       text: don't prefer the clickable ancestor of a match
+                       (on by default for click and hover)
 
 Global Options:
   --json               Output as JSON
@@ -2921,9 +2928,9 @@ The output file can be viewed in:
             r##"
 agent-browser record - Record browser session to video
 
-Usage: agent-browser record start <path.webm|path.mp4> [url] [--fps <n>] [--cursor] [--contact-sheet]
+Usage: agent-browser record start <path.webm|path.mp4> [url] [--fps <n>] [--cursor] [--contact-sheet] [--log-actions <path>]
        agent-browser record stop
-       agent-browser record restart <path.webm|path.mp4> [url] [--fps <n>] [--cursor] [--contact-sheet]
+       agent-browser record restart <path.webm|path.mp4> [url] [--fps <n>] [--cursor] [--contact-sheet] [--log-actions <path>]
 
 Record the browser to a video file. Supported formats are .webm (VP8 via
 libvpx) and .mp4 (H.264 via libx264); any other extension is handed to
@@ -2955,6 +2962,9 @@ Options:
   --cursor                        Show an animated pointer
   --contact-sheet                 Save distinct visual changes as a timestamped PNG
   --contact-sheet-threshold <n>   Changed-pixel ratio, 0-1 (default: 0.05)
+  --log-actions <path>            Write a JSONL line per user action: action, args,
+                                  tsMs (completion, ms from first frame), durationMs,
+                                  frameIdx, ok, and target {x,y} when the pointer moved
 
 Global Options:
   --json               Output as JSON
@@ -2983,6 +2993,9 @@ Examples:
 
   # Export a visual summary beside the video
   agent-browser record start ./demo.webm --cursor --contact-sheet
+
+  # Log an action timeline for aligning narration with the video
+  agent-browser record start ./demo.webm --log-actions ./demo.actions.jsonl
 
   # Restart recording with a new file (stops previous, starts new)
   agent-browser record restart ./take2.webm
@@ -4051,7 +4064,10 @@ Options:
   --screenshot-dir <path>    Default screenshot output directory (or AGENT_BROWSER_SCREENSHOT_DIR)
   --screenshot-quality <n>   JPEG quality 0-100; ignored for PNG (or AGENT_BROWSER_SCREENSHOT_QUALITY)
   --screenshot-format <fmt>  Screenshot format: png, jpeg (or AGENT_BROWSER_SCREENSHOT_FORMAT)
-  --input-mode <mode>        Session pointer movement: instant (default), smooth, human
+  --input-mode <mode>        Session pointer movement: instant (default), smooth, human.
+                             Non-instant modes glide to click, hover, fill, type, check
+                             and select targets; human also types key by key and pauses
+                             briefly after clicks
   --headed                   Show browser window (not headless) (or AGENT_BROWSER_HEADED env)
   --webgpu                   Enable WebGPU; uses SwiftShader software Vulkan on Linux, no GPU required (or AGENT_BROWSER_WEBGPU env)
   --no-webmcp                Disable default experimental WebMCP support for locally launched Chrome
