@@ -6648,6 +6648,11 @@ async fn handle_wait(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
     let session_id = mgr.active_session_id()?.to_string();
     let timeout_ms = state.timeout_ms(cmd);
 
+    if let Some(stable_ms) = cmd.get("stable").and_then(|v| v.as_u64()) {
+        wait_for_dom_stable(&mgr.client, &session_id, stable_ms, timeout_ms).await?;
+        return Ok(json!({ "waited": "stable", "ms": stable_ms }));
+    }
+
     if let Some(text) = cmd.get("text").and_then(|v| v.as_str()) {
         wait_for_text(&mgr.client, &session_id, text, timeout_ms).await?;
         return Ok(json!({ "waited": "text", "text": text }));
@@ -6970,6 +6975,32 @@ async fn wait_for_function(
     timeout_ms: u64,
 ) -> Result<(), String> {
     let check_fn = format!("!!({})", fn_str);
+    poll_until_true(client, session_id, &check_fn, timeout_ms).await
+}
+
+/// Resolves once a `MutationObserver` on `document` has seen no mutations for
+/// `stable_ms`. The observer is installed by the first poll and removed once
+/// the DOM settles; a navigation drops it with the old document.
+async fn wait_for_dom_stable(
+    client: &super::cdp::client::CdpClient,
+    session_id: &str,
+    stable_ms: u64,
+    timeout_ms: u64,
+) -> Result<(), String> {
+    let check_fn = format!(
+        r#"(() => {{
+            let s = window.__agentBrowserStable;
+            if (!s) {{
+                s = window.__agentBrowserStable = {{ last: performance.now() }};
+                s.observer = new MutationObserver(() => {{ s.last = performance.now(); }});
+                s.observer.observe(document, {{ subtree: true, childList: true, attributes: true, characterData: true }});
+            }}
+            if (performance.now() - s.last < {stable_ms}) return false;
+            s.observer.disconnect();
+            delete window.__agentBrowserStable;
+            return true;
+        }})()"#
+    );
     poll_until_true(client, session_id, &check_fn, timeout_ms).await
 }
 

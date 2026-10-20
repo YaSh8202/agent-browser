@@ -762,6 +762,25 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                 ));
             }
 
+            // Check for --stable flag: wait --stable 500
+            // Resolves once the DOM has gone `<ms>` without a MutationObserver
+            // event. Lets scripts drop magic `wait 1500` sleeps.
+            if let Some(idx) = rest.iter().position(|&s| s == "--stable") {
+                let raw = rest
+                    .get(idx + 1)
+                    .ok_or_else(|| ParseError::MissingArguments {
+                        context: "wait --stable".to_string(),
+                        usage: "wait --stable <ms>",
+                    })?;
+                let stable_ms = raw.parse::<u64>().map_err(|_| ParseError::InvalidValue {
+                    message: format!("--stable expects a number in ms, got '{}'", raw),
+                    usage: "wait --stable <ms>",
+                })?;
+                return Ok(with_timeout(
+                    json!({ "id": id, "action": "wait", "stable": stable_ms }),
+                ));
+            }
+
             // Check for --text flag: wait --text "Welcome"
             if let Some(idx) = rest.iter().position(|&s| s == "--text" || s == "-t") {
                 let text = rest
@@ -4979,6 +4998,31 @@ mod tests {
         let cmd = parse_command(&args("wait --fn window.ready"), &default_flags()).unwrap();
         assert_eq!(cmd["action"], "waitforfunction");
         assert_eq!(cmd["expression"], "window.ready");
+    }
+
+    #[test]
+    fn test_wait_stable() {
+        let cmd = parse_command(&args("wait --stable 500"), &default_flags()).unwrap();
+        assert_eq!(cmd["action"], "wait");
+        assert_eq!(cmd["stable"], 500);
+        assert!(cmd.get("timeout").is_none());
+    }
+
+    #[test]
+    fn test_wait_stable_with_timeout() {
+        let cmd = parse_command(
+            &args("wait --stable 500 --timeout 8000"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["stable"], 500);
+        assert_eq!(cmd["timeout"], 8000);
+    }
+
+    #[test]
+    fn test_wait_stable_rejects_missing_or_invalid_value() {
+        assert!(parse_command(&args("wait --stable"), &default_flags()).is_err());
+        assert!(parse_command(&args("wait --stable abc"), &default_flags()).is_err());
     }
 
     #[test]

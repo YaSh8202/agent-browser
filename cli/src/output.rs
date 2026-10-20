@@ -2130,6 +2130,7 @@ Modes:
   --load <state>       Wait for load state (load, domcontentloaded, networkidle)
   --fn <expression>    Wait for JavaScript expression to be truthy
   --text <text>        Wait for text to appear on page (substring match)
+  --stable <ms>        Wait until the DOM has gone <ms> without a mutation
   --download [path]    Wait for a download to complete (optionally save to path)
 
 Download Options (with --download):
