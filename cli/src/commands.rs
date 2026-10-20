@@ -5051,11 +5051,8 @@ mod tests {
 
     #[test]
     fn test_wait_stable_with_timeout() {
-        let cmd = parse_command(
-            &args("wait --stable 500 --timeout 8000"),
-            &default_flags(),
-        )
-        .unwrap();
+        let cmd =
+            parse_command(&args("wait --stable 500 --timeout 8000"), &default_flags()).unwrap();
         assert_eq!(cmd["stable"], 500);
         assert_eq!(cmd["timeout"], 8000);
     }
@@ -5737,7 +5734,10 @@ mod tests {
         .unwrap();
         assert_eq!(cmd["allowAmbiguous"], true);
         assert_eq!(cmd["name"], "Login");
-        assert!(cmd.get("value").is_none(), "flags must not leak into the value");
+        assert!(
+            cmd.get("value").is_none(),
+            "flags must not leak into the value"
+        );
 
         let cmd = parse_command(
             &args("find text Login click --include-hidden --no-prefer-interactive"),

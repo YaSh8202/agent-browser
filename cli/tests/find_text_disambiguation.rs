@@ -116,13 +116,7 @@ fn find_text_no_prefer_interactive_still_disambiguates() {
 
     let out = cli(
         &tmp,
-        &[
-            "find",
-            "text",
-            "Login",
-            "click",
-            "--no-prefer-interactive",
-        ],
+        &["find", "text", "Login", "click", "--no-prefer-interactive"],
     )
     .output()
     .expect("find text --no-prefer-interactive");
@@ -221,12 +215,17 @@ const LINK_FIXTURE: &str = "data:text/html,<html><head>\
 #[ignore = "requires Chrome"]
 fn find_role_link_matches_anchor_not_head_link() {
     let tmp = TempDir::new().unwrap();
-    assert!(cli(&tmp, &["open", LINK_FIXTURE]).status().unwrap().success());
+    assert!(cli(&tmp, &["open", LINK_FIXTURE])
+        .status()
+        .unwrap()
+        .success());
     std::thread::sleep(std::time::Duration::from_millis(500));
 
     let out = cli(
         &tmp,
-        &["find", "role", "link", "click", "--name", "Sign in", "--exact"],
+        &[
+            "find", "role", "link", "click", "--name", "Sign in", "--exact",
+        ],
     )
     .output()
     .expect("find role link --exact");
@@ -261,13 +260,22 @@ const DUAL_SPAN_FIXTURE: &str = "data:text/html,<html><head>\
 #[ignore = "requires Chrome"]
 fn find_role_button_dedups_shadcn_dual_spans() {
     let tmp = TempDir::new().unwrap();
-    assert!(cli(&tmp, &["open", DUAL_SPAN_FIXTURE]).status().unwrap().success());
+    assert!(cli(&tmp, &["open", DUAL_SPAN_FIXTURE])
+        .status()
+        .unwrap()
+        .success());
     std::thread::sleep(std::time::Duration::from_millis(500));
 
     let out = cli(
         &tmp,
         &[
-            "find", "role", "button", "click", "--name", "Add Server", "--exact",
+            "find",
+            "role",
+            "button",
+            "click",
+            "--name",
+            "Add Server",
+            "--exact",
         ],
     )
     .output()

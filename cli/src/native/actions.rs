@@ -10991,8 +10991,8 @@ async fn locate_text_with_disambiguation(
     let session_id = mgr.active_session_id()?.to_string();
 
     let value_json = serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string());
-    let interactive_sel_json = serde_json::to_string(INTERACTIVE_CSS_SELECTOR)
-        .unwrap_or_else(|_| "\"\"".to_string());
+    let interactive_sel_json =
+        serde_json::to_string(INTERACTIVE_CSS_SELECTOR).unwrap_or_else(|_| "\"\"".to_string());
     let match_expr = if exact {
         format!("el.textContent.trim() === {}", value_json)
     } else {
@@ -11090,11 +11090,7 @@ async fn locate_text_with_disambiguation(
                 } else {
                     format!(" role=\"{}\"", m.role)
                 },
-                if m.interactive {
-                    " (interactive)"
-                } else {
-                    ""
-                },
+                if m.interactive { " (interactive)" } else { "" },
                 if m.visible { "" } else { " hidden" },
                 if m.name.is_empty() {
                     "(no name)".to_string()
@@ -14638,7 +14634,13 @@ mod tests {
         ];
 
         let matches = find_ax_node_by_role(&nodes, "button", Some("login"), false).unwrap();
-        assert_eq!(matches, [(10, "Login".to_string()), (11, "Login with Google".to_string())]);
+        assert_eq!(
+            matches,
+            [
+                (10, "Login".to_string()),
+                (11, "Login with Google".to_string())
+            ]
+        );
         let exact = find_ax_node_by_role(&nodes, "button", Some("Login"), true).unwrap();
         assert_eq!(exact, [(10, "Login".to_string())]);
 
@@ -14656,9 +14658,8 @@ mod tests {
             ax_node("heading", "Skills", Some(43), false),
         ];
 
-        let (backend_id, actual_name) =
-            first_role_match(&nodes, "link", Some("Services"), true)
-                .expect("computed AX link role should match the anchor");
+        let (backend_id, actual_name) = first_role_match(&nodes, "link", Some("Services"), true)
+            .expect("computed AX link role should match the anchor");
         assert_eq!(backend_id, 42);
         assert_eq!(actual_name, "Services");
 
@@ -14672,10 +14673,8 @@ mod tests {
         let nodes = vec![ax_node("heading", "SKILLS", Some(43), false)];
 
         for query in ["Skills", "skills", "SKILLS", "kill"] {
-            let (backend_id, actual_name) =
-                first_role_match(&nodes, "heading", Some(query), false).unwrap_or_else(|e| {
-                    panic!("expected case-insensitive match for {query:?}: {e}")
-                });
+            let (backend_id, actual_name) = first_role_match(&nodes, "heading", Some(query), false)
+                .unwrap_or_else(|e| panic!("expected case-insensitive match for {query:?}: {e}"));
             assert_eq!(backend_id, 43);
             assert_eq!(actual_name, "SKILLS");
         }
@@ -14737,9 +14736,8 @@ mod tests {
     fn find_ax_node_by_role_supports_substring_matching() {
         let nodes = vec![ax_node("button", "Submit form", Some(7), false)];
 
-        let (backend_id, actual_name) =
-            first_role_match(&nodes, "button", Some("submit"), false)
-                .expect("substring matching should be allowed without exact");
+        let (backend_id, actual_name) = first_role_match(&nodes, "button", Some("submit"), false)
+            .expect("substring matching should be allowed without exact");
         assert_eq!(backend_id, 7);
         assert_eq!(actual_name, "Submit form");
 
@@ -14767,9 +14765,8 @@ mod tests {
             ax_node("link", "Services", Some(42), false),
         ];
 
-        let (backend_id, actual_name) =
-            first_role_match(&nodes, "link", Some("Services"), true)
-                .expect("lookup should continue past matching virtual AX nodes");
+        let (backend_id, actual_name) = first_role_match(&nodes, "link", Some("Services"), true)
+            .expect("lookup should continue past matching virtual AX nodes");
         assert_eq!(backend_id, 42);
         assert_eq!(actual_name, "Services");
     }

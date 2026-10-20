@@ -27,26 +27,28 @@ fn cli(tmp: &TempDir, args: &[&str]) -> Command {
 
 // Static page — wait --stable should resolve almost immediately because the
 // MutationObserver never fires.
-const STATIC_FIXTURE: &str =
-    "data:text/html,<html><body><h1>Hello</h1><p>static</p></body></html>";
+const STATIC_FIXTURE: &str = "data:text/html,<html><body><h1>Hello</h1><p>static</p></body></html>";
 
 #[test]
 #[ignore = "requires Chrome"]
 fn wait_stable_resolves_quickly_on_static_page() {
     let tmp = TempDir::new().unwrap();
-    assert!(cli(&tmp, &["open", STATIC_FIXTURE]).status().unwrap().success());
+    assert!(cli(&tmp, &["open", STATIC_FIXTURE])
+        .status()
+        .unwrap()
+        .success());
     std::thread::sleep(std::time::Duration::from_millis(300));
 
     let start = Instant::now();
-    let status = cli(
-        &tmp,
-        &["wait", "--stable", "300", "--timeout", "5000"],
-    )
-    .status()
-    .expect("wait --stable on static page");
+    let status = cli(&tmp, &["wait", "--stable", "300", "--timeout", "5000"])
+        .status()
+        .expect("wait --stable on static page");
     let elapsed = start.elapsed();
 
-    assert!(status.success(), "wait --stable should succeed on static page");
+    assert!(
+        status.success(),
+        "wait --stable should succeed on static page"
+    );
     assert!(
         elapsed.as_millis() < 2_000,
         "expected fast resolution (<2s), took {}ms",
@@ -73,20 +75,23 @@ const MUTATING_FIXTURE: &str = "data:text/html,<html><body>\
 #[ignore = "requires Chrome"]
 fn wait_stable_waits_for_mutations_to_settle() {
     let tmp = TempDir::new().unwrap();
-    assert!(cli(&tmp, &["open", MUTATING_FIXTURE]).status().unwrap().success());
+    assert!(cli(&tmp, &["open", MUTATING_FIXTURE])
+        .status()
+        .unwrap()
+        .success());
     // Don't sleep too long here — we want to enter wait --stable while the
     // page is still mutating.
 
     let start = Instant::now();
-    let status = cli(
-        &tmp,
-        &["wait", "--stable", "300", "--timeout", "5000"],
-    )
-    .status()
-    .expect("wait --stable on mutating page");
+    let status = cli(&tmp, &["wait", "--stable", "300", "--timeout", "5000"])
+        .status()
+        .expect("wait --stable on mutating page");
     let elapsed = start.elapsed();
 
-    assert!(status.success(), "wait --stable should succeed once settled");
+    assert!(
+        status.success(),
+        "wait --stable should succeed once settled"
+    );
     // Mutations run for 600ms then 300ms quiet = ~900ms floor. Allow
     // generous CI variance.
     assert!(
@@ -117,13 +122,19 @@ const CHURNING_FIXTURE: &str = "data:text/html,<html><body>\
 #[ignore = "requires Chrome"]
 fn wait_stable_times_out_on_churning_page() {
     let tmp = TempDir::new().unwrap();
-    assert!(cli(&tmp, &["open", CHURNING_FIXTURE]).status().unwrap().success());
+    assert!(cli(&tmp, &["open", CHURNING_FIXTURE])
+        .status()
+        .unwrap()
+        .success());
 
     let status = cli(&tmp, &["wait", "--stable", "1500", "--timeout", "3000"])
         .status()
         .expect("wait --stable on churning page");
 
-    assert!(!status.success(), "wait --stable must fail when the DOM never settles");
+    assert!(
+        !status.success(),
+        "wait --stable must fail when the DOM never settles"
+    );
 
     let _ = cli(&tmp, &["close", "--all"]).status();
 }

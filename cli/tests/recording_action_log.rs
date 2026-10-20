@@ -62,7 +62,12 @@ fn record_log_actions_writes_a_timeline_of_user_actions() {
     run(&tmp, &["hover", "#b"]);
     run(&tmp, &["click", "#b"]);
     run(&tmp, &["fill", "#email", "a@example.com"]);
-    run(&tmp, &["find", "role", "button", "click", "--name", "Save", "--exact"]);
+    run(
+        &tmp,
+        &[
+            "find", "role", "button", "click", "--name", "Save", "--exact",
+        ],
+    );
     // Read-only commands are not user actions and stay out of the timeline.
     run(&tmp, &["get", "url"]);
     let stop = cli(&tmp, &["--json", "record", "stop"]).output().unwrap();
@@ -91,7 +96,10 @@ fn record_log_actions_writes_a_timeline_of_user_actions() {
         assert!(entry["frameIdx"].is_u64(), "{entry}");
     }
     assert_eq!(entries[0]["args"]["selector"], "#b");
-    assert!(entries[0]["target"]["x"].is_i64(), "hover moves the pointer");
+    assert!(
+        entries[0]["target"]["x"].is_i64(),
+        "hover moves the pointer"
+    );
     assert_eq!(entries[2]["args"]["value"], "a@example.com");
     assert_eq!(entries[3]["args"]["via"], "getbyrole");
     assert_eq!(entries[3]["args"]["name"], "Save");
@@ -121,7 +129,12 @@ fn human_input_mode_set_on_record_start_paces_later_commands() {
         ],
     );
     run(&tmp, &["fill", "#email", "hello world"]);
-    run(&tmp, &["find", "role", "button", "click", "--name", "Save", "--exact"]);
+    run(
+        &tmp,
+        &[
+            "find", "role", "button", "click", "--name", "Save", "--exact",
+        ],
+    );
     let value = cli(&tmp, &["get", "value", "#email"]).output().unwrap();
     run(&tmp, &["record", "stop"]);
     let _ = cli(&tmp, &["close", "--all"]).status();
@@ -134,10 +147,19 @@ fn human_input_mode_set_on_record_start_paces_later_commands() {
         .collect();
     let (fill, click) = (&entries[0], &entries[1]);
     assert_eq!(fill["action"], "fill", "{entries:?}");
-    assert!(fill["target"]["x"].is_i64(), "fill should glide to the input: {fill}");
+    assert!(
+        fill["target"]["x"].is_i64(),
+        "fill should glide to the input: {fill}"
+    );
     // 11 keystrokes at no less than 65ms each.
     assert!(fill["durationMs"].as_u64().unwrap() >= 700, "{fill}");
     assert_eq!(click["action"], "click", "{entries:?}");
-    assert!(click["target"]["x"].is_i64(), "find click should glide: {click}");
-    assert!(click["durationMs"].as_u64().unwrap() >= 250, "click dwell: {click}");
+    assert!(
+        click["target"]["x"].is_i64(),
+        "find click should glide: {click}"
+    );
+    assert!(
+        click["durationMs"].as_u64().unwrap() >= 250,
+        "click dwell: {click}"
+    );
 }

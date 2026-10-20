@@ -1419,11 +1419,18 @@ mod tests {
         assert!(delays
             .iter()
             .all(|d| (HUMAN_KEY_DELAY_MS..=HUMAN_KEY_DELAY_MS + HUMAN_KEY_JITTER_MS).contains(d)));
-        assert!(delays.iter().any(|d| *d != delays[0]), "keystrokes should not tick evenly");
+        assert!(
+            delays.iter().any(|d| *d != delays[0]),
+            "keystrokes should not tick evenly"
+        );
         assert_eq!(human_key_delay_ms(7, 3), delays[3]);
         assert_ne!(
-            (0..20).map(|i| human_key_delay_ms(1, i)).collect::<Vec<_>>(),
-            (0..20).map(|i| human_key_delay_ms(2, i)).collect::<Vec<_>>()
+            (0..20)
+                .map(|i| human_key_delay_ms(1, i))
+                .collect::<Vec<_>>(),
+            (0..20)
+                .map(|i| human_key_delay_ms(2, i))
+                .collect::<Vec<_>>()
         );
     }
 }
