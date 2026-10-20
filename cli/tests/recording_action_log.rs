@@ -96,3 +96,48 @@ fn record_log_actions_writes_a_timeline_of_user_actions() {
     assert_eq!(entries[3]["args"]["via"], "getbyrole");
     assert_eq!(entries[3]["args"]["name"], "Save");
 }
+
+#[test]
+#[ignore = "requires Chrome and ffmpeg"]
+fn human_input_mode_set_on_record_start_paces_later_commands() {
+    let tmp = TempDir::new().unwrap();
+    let video = tmp.path().join("take.webm");
+    let log = tmp.path().join("take.actions.jsonl");
+
+    run(&tmp, &["open", FIXTURE]);
+    // A global flag on `record start` becomes the session default, so the
+    // commands below glide and type like a person without repeating it.
+    run(
+        &tmp,
+        &[
+            "record",
+            "start",
+            video.to_str().unwrap(),
+            "--log-actions",
+            log.to_str().unwrap(),
+            "--cursor",
+            "--input-mode",
+            "human",
+        ],
+    );
+    run(&tmp, &["fill", "#email", "hello world"]);
+    run(&tmp, &["find", "role", "button", "click", "--name", "Save", "--exact"]);
+    let value = cli(&tmp, &["get", "value", "#email"]).output().unwrap();
+    run(&tmp, &["record", "stop"]);
+    let _ = cli(&tmp, &["close", "--all"]).status();
+    assert_eq!(String::from_utf8_lossy(&value.stdout).trim(), "hello world");
+
+    let entries: Vec<Value> = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let (fill, click) = (&entries[0], &entries[1]);
+    assert_eq!(fill["action"], "fill", "{entries:?}");
+    assert!(fill["target"]["x"].is_i64(), "fill should glide to the input: {fill}");
+    // 11 keystrokes at no less than 65ms each.
+    assert!(fill["durationMs"].as_u64().unwrap() >= 700, "{fill}");
+    assert_eq!(click["action"], "click", "{entries:?}");
+    assert!(click["target"]["x"].is_i64(), "find click should glide: {click}");
+    assert!(click["durationMs"].as_u64().unwrap() >= 250, "click dwell: {click}");
+}

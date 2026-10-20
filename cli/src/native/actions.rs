@@ -6292,6 +6292,74 @@ fn record_click_animation(
     }
 }
 
+/// Unless input mode is instant, glide the pointer to the element's center
+/// before acting on it, so pointer-path handlers fire and recordings show the
+/// approach. Human mode bends the path; smooth mode moves straight in 200ms.
+async fn approach_element(
+    cmd: &Value,
+    state: &mut DaemonState,
+    selector: &str,
+) -> Result<(), String> {
+    let input_mode = cmd
+        .get("inputMode")
+        .and_then(Value::as_str)
+        .unwrap_or(&state.input_mode);
+    if input_mode == "instant" {
+        return Ok(());
+    }
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let session_id = mgr.active_session_id()?.to_string();
+    let (x, y, target_session_id) = super::element::resolve_element_center(
+        &mgr.client,
+        &session_id,
+        &state.ref_map,
+        selector,
+        &state.iframe_sessions,
+    )
+    .await?;
+    let offset = super::element::session_viewport_offset(
+        &mgr.client,
+        &session_id,
+        &target_session_id,
+        &state.iframe_sessions,
+    )
+    .await?;
+    move_mouse_interpolated(
+        &mgr.client,
+        &target_session_id,
+        &mut state.mouse_state,
+        x,
+        y,
+        if input_mode == "smooth" { 200 } else { 0 },
+        None,
+        input_mode == "human",
+        cmd.get("seed").and_then(Value::as_u64).unwrap_or(0),
+        0,
+        offset,
+        &state.recording_state.shared_cursor,
+    )
+    .await
+}
+
+/// The `--seed` that varies human pacing, or `None` outside human input mode.
+fn human_input_seed(cmd: &Value, state: &DaemonState) -> Option<u64> {
+    let input_mode = cmd
+        .get("inputMode")
+        .and_then(Value::as_str)
+        .unwrap_or(&state.input_mode);
+    (input_mode == "human").then(|| cmd.get("seed").and_then(Value::as_u64).unwrap_or(0))
+}
+
+/// How long human mode holds still after a click, so a recording shows each
+/// click land before the pointer heads for the next target.
+const HUMAN_CLICK_DWELL: std::time::Duration = std::time::Duration::from_millis(250);
+
+async fn human_click_dwell(cmd: &Value, state: &DaemonState) {
+    if human_input_seed(cmd, state).is_some() {
+        tokio::time::sleep(HUMAN_CLICK_DWELL).await;
+    }
+}
+
 async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
     let selector = cmd
         .get("selector")
@@ -6384,43 +6452,8 @@ async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
     let button = cmd.get("button").and_then(|v| v.as_str()).unwrap_or("left");
     let click_count = cmd.get("clickCount").and_then(|v| v.as_i64()).unwrap_or(1) as i32;
 
-    let input_mode = cmd
-        .get("inputMode")
-        .and_then(Value::as_str)
-        .unwrap_or(&state.input_mode);
-    if input_mode != "instant" {
-        let (x, y, target_session_id) = super::element::resolve_element_center(
-            &mgr.client,
-            &session_id,
-            &state.ref_map,
-            selector,
-            &state.iframe_sessions,
-        )
-        .await?;
-        let offset = super::element::session_viewport_offset(
-            &mgr.client,
-            &session_id,
-            &target_session_id,
-            &state.iframe_sessions,
-        )
-        .await?;
-        move_mouse_interpolated(
-            &mgr.client,
-            &target_session_id,
-            &mut state.mouse_state,
-            x,
-            y,
-            if input_mode == "smooth" { 200 } else { 0 },
-            None,
-            input_mode == "human",
-            cmd.get("seed").and_then(Value::as_u64).unwrap_or(0),
-            0,
-            offset,
-            &state.recording_state.shared_cursor,
-        )
-        .await?;
-    }
-
+    approach_element(cmd, state, selector).await?;
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let result = interaction::click(
         &mgr.client,
         &session_id,
@@ -6436,6 +6469,7 @@ async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
         &mut state.mouse_state,
         &state.recording_state.shared_cursor,
     );
+    human_click_dwell(cmd, state).await;
 
     if result.dialog_opened {
         state.pending_pointer_release = result.pending_release;
@@ -6445,12 +6479,13 @@ async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
 }
 
 async fn handle_dblclick(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
     let selector = cmd
         .get("selector")
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
+    approach_element(cmd, state, selector).await?;
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let session_id = mgr.active_session_id()?.to_string();
 
     let result = interaction::dblclick(
         &mgr.client,
@@ -6489,6 +6524,9 @@ async fn handle_fill(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
         }
     }
 
+    // The approach is cosmetic here: fill focuses through the DOM, so an
+    // element without a box (e.g. a visually hidden input) must still fill.
+    let _ = approach_element(cmd, state, selector).await;
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
 
@@ -6499,14 +6537,13 @@ async fn handle_fill(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
         selector,
         value,
         &state.iframe_sessions,
+        human_input_seed(cmd, state),
     )
     .await?;
     Ok(json!({ "filled": selector }))
 }
 
 async fn handle_type(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
     let selector = cmd
         .get("selector")
         .and_then(|v| v.as_str())
@@ -6518,6 +6555,11 @@ async fn handle_type(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
     let clear = cmd.get("clear").and_then(|v| v.as_bool()).unwrap_or(false);
     let delay = cmd.get("delay").and_then(|v| v.as_u64());
 
+    // Cosmetic, as in handle_fill.
+    let _ = approach_element(cmd, state, selector).await;
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let session_id = mgr.active_session_id()?.to_string();
+
     interaction::type_text(
         &mgr.client,
         &session_id,
@@ -6527,6 +6569,8 @@ async fn handle_type(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
         clear,
         delay,
         &state.iframe_sessions,
+        // An explicit --delay keeps its fixed pacing.
+        human_input_seed(cmd, state).filter(|_| delay.is_none()),
     )
     .await?;
     Ok(json!({ "typed": text }))
@@ -6588,12 +6632,13 @@ fn parse_key_chord(input: &str) -> (String, Option<i32>) {
 }
 
 async fn handle_hover(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
     let selector = cmd
         .get("selector")
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
+    approach_element(cmd, state, selector).await?;
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let session_id = mgr.active_session_id()?.to_string();
 
     let position = interaction::hover(
         &mgr.client,
@@ -6645,12 +6690,14 @@ async fn handle_scroll(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
 }
 
 async fn handle_select(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
     let selector = cmd
         .get("selector")
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
+    // Cosmetic, as in handle_fill.
+    let _ = approach_element(cmd, state, selector).await;
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let session_id = mgr.active_session_id()?.to_string();
 
     let values: Vec<String> = match cmd.get("values") {
         Some(Value::Array(arr)) => arr
@@ -6678,12 +6725,14 @@ async fn handle_select(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
 }
 
 async fn handle_check(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
     let selector = cmd
         .get("selector")
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
+    // Cosmetic: a styled checkbox can hide its input, which still toggles.
+    let _ = approach_element(cmd, state, selector).await;
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let session_id = mgr.active_session_id()?.to_string();
 
     if let Some(position) = interaction::check(
         &mgr.client,
@@ -6703,12 +6752,14 @@ async fn handle_check(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
 }
 
 async fn handle_uncheck(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
     let selector = cmd
         .get("selector")
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
+    // Cosmetic: a styled checkbox can hide its input, which still toggles.
+    let _ = approach_element(cmd, state, selector).await;
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let session_id = mgr.active_session_id()?.to_string();
 
     if let Some(position) = interaction::uncheck(
         &mgr.client,
@@ -7630,8 +7681,14 @@ async fn handle_keyboard(cmd: &Value, state: &DaemonState) -> Result<Value, Stri
                 .get("text")
                 .and_then(|v| v.as_str())
                 .ok_or("Missing 'text' parameter")?;
-            interaction::type_text_into_active_context(&mgr.client, &session_id, text, None)
-                .await?;
+            interaction::type_text_into_active_context(
+                &mgr.client,
+                &session_id,
+                text,
+                None,
+                human_input_seed(cmd, state),
+            )
+            .await?;
             return Ok(json!({ "typed": text }));
         }
         Some("insertText") => {
@@ -10167,6 +10224,14 @@ async fn execute_subaction(
         ));
     }
 
+    match subaction {
+        "click" | "hover" => approach_element(cmd, state, selector).await?,
+        // Cosmetic, as in handle_fill.
+        "fill" | "check" => {
+            let _ = approach_element(cmd, state, selector).await;
+        }
+        _ => {}
+    }
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
 
@@ -10187,6 +10252,7 @@ async fn execute_subaction(
                 &mut state.mouse_state,
                 &state.recording_state.shared_cursor,
             );
+            human_click_dwell(cmd, state).await;
             if result.dialog_opened {
                 state.pending_pointer_release = result.pending_release;
                 return Ok(json!({ "clicked": selector, "dialogOpened": true }));
@@ -10205,6 +10271,7 @@ async fn execute_subaction(
                 selector,
                 value,
                 &state.iframe_sessions,
+                human_input_seed(cmd, state),
             )
             .await?;
             Ok(json!({ "filled": selector }))
