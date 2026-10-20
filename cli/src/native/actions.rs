@@ -1184,6 +1184,7 @@ impl DaemonState {
                 return Err(format!("Failed to install recording cursor: {error}"));
             }
         }
+        self.recording_state.started_at = Some(std::time::Instant::now());
         let handle = recording::spawn_recording_task(
             client,
             capture_session,
@@ -1212,6 +1213,7 @@ impl DaemonState {
     /// Reconcile every externally visible recording flag after startup fails.
     async fn rollback_failed_recording_start(&mut self) {
         self.recording_state.active = false;
+        self.recording_state.action_log = None;
         if let Some(ref server) = self.stream_server {
             server.set_recording(false, &self.engine).await;
         }
@@ -2633,6 +2635,85 @@ fn should_validate_restore_after_action(action: &str) -> bool {
     action != "launch"
 }
 
+/// Command fields copied into a `--log-actions` entry. Everything else on the
+/// command (ids, plugins, restore and session settings) is transport detail.
+const ACTION_LOG_ARGS: &[&str] = &[
+    "url",
+    "selector",
+    "value",
+    "values",
+    "text",
+    "key",
+    "role",
+    "name",
+    "label",
+    "placeholder",
+    "testId",
+    "index",
+    "exact",
+    "direction",
+    "amount",
+    "x",
+    "y",
+];
+
+/// Append a finished user action to the recording's `--log-actions` timeline.
+/// `tsMs` marks completion in ms since the video's first frame, so the action
+/// spans `[tsMs - durationMs, tsMs]` of the video. `find` locators are logged
+/// as the action they performed, with the locator under `args.via`.
+fn log_recorded_action(
+    state: &mut DaemonState,
+    action: &str,
+    cmd: &Value,
+    result: &Result<Value, String>,
+    started: std::time::Instant,
+    pointer_before: (f64, f64),
+) {
+    let recording = &mut state.recording_state;
+    let (true, Some(log), Some(video_start)) = (
+        recording.active,
+        recording.action_log.as_mut(),
+        recording.started_at,
+    ) else {
+        return;
+    };
+    let name = match action {
+        "navigate" | "click" | "dblclick" | "fill" | "type" | "press" | "hover" | "scroll"
+        | "select" | "check" | "uncheck" => action,
+        _ if action.starts_with("getby") || action == "nth" => cmd
+            .get("subaction")
+            .and_then(Value::as_str)
+            .unwrap_or("click"),
+        _ => return,
+    };
+
+    let mut args: serde_json::Map<String, Value> = ACTION_LOG_ARGS
+        .iter()
+        .filter_map(|key| cmd.get(*key).map(|v| (key.to_string(), v.clone())))
+        .collect();
+    if name != action {
+        args.insert("via".to_string(), json!(action));
+    }
+    let ts_ms = video_start.elapsed().as_millis() as u64;
+    let mut entry = json!({
+        "action": name,
+        "args": args,
+        "tsMs": ts_ms,
+        "durationMs": started.elapsed().as_millis() as u64,
+        // Frames are paced against wall clock, so time maps straight to index.
+        "frameIdx": ts_ms * u64::from(recording.fps) / 1000,
+        "ok": result.is_ok(),
+    });
+    let pointer = (state.mouse_state.x, state.mouse_state.y);
+    if pointer != pointer_before {
+        entry["target"] = json!({ "x": pointer.0.round() as i64, "y": pointer.1.round() as i64 });
+    }
+    if let Err(error) = result {
+        entry["error"] = json!(error);
+    }
+    log.append(&entry);
+}
+
 fn policy_actions_for_command(
     cmd: &Value,
     action: &str,
@@ -3007,6 +3088,8 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         }
     }
 
+    let action_started = std::time::Instant::now();
+    let pointer_before = (state.mouse_state.x, state.mouse_state.y);
     let result = match action {
         "launch" => {
             let webmcp_enabled = cmd
@@ -3189,6 +3272,7 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         "mouseup" => handle_mouseup(cmd, state).await,
         _ => Err(format!("Not yet implemented: {}", action)),
     };
+    log_recorded_action(state, action, cmd, &result, action_started, pointer_before);
 
     if result.is_ok() && should_validate_restore_after_action(action) {
         validate_restore_if_pending(state).await;
@@ -8044,6 +8128,16 @@ fn recording_options_from_command(cmd: &Value) -> Result<recording::RecordingOpt
     })
 }
 
+/// Open the `--log-actions` file before any browser work, so a bad path fails
+/// the command without touching the page or an in-flight take.
+fn recording_action_log_from_command(cmd: &Value) -> Result<Option<recording::ActionLog>, String> {
+    cmd.get("logActions")
+        .and_then(Value::as_str)
+        .filter(|path| !path.is_empty())
+        .map(recording::ActionLog::open)
+        .transpose()
+}
+
 /// Start recording the current active page. The recorder attaches to the
 /// active session as-is: no new browser context, no new tab, and no
 /// navigation unless a URL is given (in which case the active tab navigates
@@ -8070,6 +8164,7 @@ async fn handle_recording_start(cmd: &Value, state: &mut DaemonState) -> Result<
     // costs nothing.
     let options = recording_options_from_command(cmd)?;
     recording::validate_output_path(path)?;
+    let action_log = recording_action_log_from_command(cmd)?;
 
     {
         let domain_filter = state.domain_filter.read().await;
@@ -8098,6 +8193,7 @@ async fn handle_recording_start(cmd: &Value, state: &mut DaemonState) -> Result<
     };
 
     let result = recording::recording_start(&mut state.recording_state, path, options)?;
+    state.recording_state.action_log = action_log;
     state.start_recording_task(client, session_id).await?;
 
     if let Some(ref server) = state.stream_server {
@@ -8135,6 +8231,7 @@ async fn handle_recording_restart(cmd: &Value, state: &mut DaemonState) -> Resul
     // Validate the path and rate before stopping the in-flight take.
     recording::validate_output_path(path)?;
     let options = recording_options_from_command(cmd)?;
+    let action_log = recording_action_log_from_command(cmd)?;
 
     {
         let domain_filter = state.domain_filter.read().await;
@@ -8172,6 +8269,7 @@ async fn handle_recording_restart(cmd: &Value, state: &mut DaemonState) -> Resul
     };
 
     recording::recording_start(&mut state.recording_state, path, options)?;
+    state.recording_state.action_log = action_log;
 
     if let Some((client, session_id)) = recording_target {
         state.start_recording_task(client, session_id).await?;

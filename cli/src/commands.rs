@@ -1760,7 +1760,7 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                     "recording_start",
                     &rest[1..],
                     "record start",
-                    "record start <output.webm|output.mp4> [url] [--fps <n>] [--cursor] [--contact-sheet] [--contact-sheet-threshold <0-1>]",
+                    "record start <output.webm|output.mp4> [url] [--fps <n>] [--cursor] [--contact-sheet] [--contact-sheet-threshold <0-1>] [--log-actions <path>]",
                 ),
                 Some("stop") => Ok(json!({ "id": id, "action": "recording_stop" })),
                 Some("restart") => parse_record_take(
@@ -1768,7 +1768,7 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                     "recording_restart",
                     &rest[1..],
                     "record restart",
-                    "record restart <output.webm|output.mp4> [url] [--fps <n>] [--cursor] [--contact-sheet] [--contact-sheet-threshold <0-1>]",
+                    "record restart <output.webm|output.mp4> [url] [--fps <n>] [--cursor] [--contact-sheet] [--contact-sheet-threshold <0-1>] [--log-actions <path>]",
                 ),
                 Some(sub) => Err(ParseError::UnknownSubcommand {
                     subcommand: sub.to_string(),
@@ -2419,8 +2419,8 @@ fn parse_read(rest: &[&str], id: &str, flags: &Flags) -> Result<Value, ParseErro
 }
 
 /// Parse the arguments shared by `record start` and `record restart`:
-/// `<path> [url] [--fps <n>] [--cursor] [--contact-sheet]` plus an optional
-/// contact-sheet pixel-difference threshold.
+/// `<path> [url] [--fps <n>] [--cursor] [--contact-sheet] [--log-actions <path>]`
+/// plus an optional contact-sheet pixel-difference threshold.
 ///
 /// `rest` excludes the subcommand. `path` needs an extension so ffmpeg can
 /// pick a container (`.webm` and `.mp4` are the tuned ones). Recording
@@ -2441,6 +2441,7 @@ fn parse_record_take(
     let mut cursor = false;
     let mut contact_sheet = false;
     let mut contact_sheet_threshold: Option<f64> = None;
+    let mut log_actions: Option<&str> = None;
 
     let mut i = 0;
     while i < rest.len() {
@@ -2503,6 +2504,16 @@ fn parse_record_take(
                 contact_sheet_threshold = Some(parsed);
                 i += 2;
             }
+            "--log-actions" => {
+                let value = rest
+                    .get(i + 1)
+                    .ok_or_else(|| ParseError::MissingArguments {
+                        context: format!("{} --log-actions", context),
+                        usage,
+                    })?;
+                log_actions = Some(value);
+                i += 2;
+            }
             flag if flag.starts_with("--") => {
                 return Err(ParseError::InvalidValue {
                     message: format!("Unknown flag for {}: {}", context, flag),
@@ -2551,6 +2562,9 @@ fn parse_record_take(
     }
     if let Some(threshold) = contact_sheet_threshold {
         cmd["contactSheetThreshold"] = json!(threshold);
+    }
+    if let Some(log_path) = log_actions {
+        cmd["logActions"] = json!(log_path);
     }
     Ok(cmd)
 }
@@ -5115,6 +5129,31 @@ mod tests {
         assert!(cmd.get("url").is_none());
         // Omitting --fps lets the daemon apply its 30 fps default.
         assert!(cmd.get("fps").is_none());
+    }
+
+    #[test]
+    fn test_record_log_actions() {
+        let cmd = parse_command(
+            &args("record start output.webm --log-actions /tmp/take.jsonl --cursor"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["logActions"], "/tmp/take.jsonl");
+        assert_eq!(cmd["cursor"], true);
+
+        let cmd = parse_command(
+            &args("record restart output.webm --log-actions /tmp/take.jsonl"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["action"], "recording_restart");
+        assert_eq!(cmd["logActions"], "/tmp/take.jsonl");
+
+        assert!(parse_command(
+            &args("record start output.webm --log-actions"),
+            &default_flags()
+        )
+        .is_err());
     }
 
     #[test]

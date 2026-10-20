@@ -2922,9 +2922,9 @@ The output file can be viewed in:
             r##"
 agent-browser record - Record browser session to video
 
-Usage: agent-browser record start <path.webm|path.mp4> [url] [--fps <n>] [--cursor] [--contact-sheet]
+Usage: agent-browser record start <path.webm|path.mp4> [url] [--fps <n>] [--cursor] [--contact-sheet] [--log-actions <path>]
        agent-browser record stop
-       agent-browser record restart <path.webm|path.mp4> [url] [--fps <n>] [--cursor] [--contact-sheet]
+       agent-browser record restart <path.webm|path.mp4> [url] [--fps <n>] [--cursor] [--contact-sheet] [--log-actions <path>]
 
 Record the browser to a video file. Supported formats are .webm (VP8 via
 libvpx) and .mp4 (H.264 via libx264); any other extension is handed to
@@ -2956,6 +2956,9 @@ Options:
   --cursor                        Show an animated pointer
   --contact-sheet                 Save distinct visual changes as a timestamped PNG
   --contact-sheet-threshold <n>   Changed-pixel ratio, 0-1 (default: 0.05)
+  --log-actions <path>            Write a JSONL line per user action: action, args,
+                                  tsMs (completion, ms from first frame), durationMs,
+                                  frameIdx, ok, and target {x,y} when the pointer moved
 
 Global Options:
   --json               Output as JSON
@@ -2984,6 +2987,9 @@ Examples:
 
   # Export a visual summary beside the video
   agent-browser record start ./demo.webm --cursor --contact-sheet
+
+  # Log an action timeline for aligning narration with the video
+  agent-browser record start ./demo.webm --log-actions ./demo.actions.jsonl
 
   # Restart recording with a new file (stops previous, starts new)
   agent-browser record restart ./take2.webm

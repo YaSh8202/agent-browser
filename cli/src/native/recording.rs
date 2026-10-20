@@ -542,6 +542,42 @@ pub struct RecordingState {
     pub contact_sheet: bool,
     pub contact_sheet_threshold: f64,
     pub contact_sheet_path: Option<String>,
+    /// `--log-actions` timeline for the active take.
+    pub action_log: Option<ActionLog>,
+    /// When the capture task started, i.e. the video's first frame.
+    pub started_at: Option<std::time::Instant>,
+}
+
+/// JSONL timeline of the actions taken during a recording, one line per
+/// action, so callers can align narration or edits with the video.
+pub struct ActionLog {
+    pub path: String,
+    file: std::fs::File,
+}
+
+impl ActionLog {
+    /// Create (or truncate) the log up front so a bad path fails the `record`
+    /// command instead of silently dropping entries later.
+    pub fn open(path: &str) -> Result<Self, String> {
+        if let Some(parent) = Path::new(path).parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("Failed to create action log directory: {}", e))?;
+            }
+        }
+        let file = std::fs::File::create(path)
+            .map_err(|e| format!("Failed to open action log {}: {}", path, e))?;
+        Ok(Self {
+            path: path.to_string(),
+            file,
+        })
+    }
+
+    /// Unbuffered so a killed daemon still leaves every completed action on disk.
+    pub fn append(&mut self, entry: &Value) {
+        use std::io::Write as _;
+        let _ = writeln!(self.file, "{}", entry);
+    }
 }
 
 impl RecordingState {
@@ -565,6 +601,8 @@ impl RecordingState {
             contact_sheet: false,
             contact_sheet_threshold: DEFAULT_CONTACT_SHEET_THRESHOLD,
             contact_sheet_path: None,
+            action_log: None,
+            started_at: None,
         }
     }
 }
@@ -676,6 +714,7 @@ pub fn recording_stop(state: &mut RecordingState) -> Result<Value, String> {
     }
 
     state.active = false;
+    let action_log = state.action_log.take();
 
     if state.frame_count == 0 {
         return Err("No frames captured".to_string());
@@ -687,6 +726,9 @@ pub fn recording_stop(state: &mut RecordingState) -> Result<Value, String> {
         "capturedFrames": state.captured_count,
         "fps": state.fps,
     });
+    if let Some(log) = action_log {
+        result["actionLog"] = json!(log.path);
+    }
     if let Some(ref path) = state.contact_sheet_path {
         result["contactSheetPath"] = json!(path);
         result["contactSheetFrames"] = json!(state.contact_sheet_frame_count);
@@ -2982,6 +3024,35 @@ mod tests {
         let result = recording_stop(&mut state).unwrap();
         assert_eq!(result["frames"], 120);
         assert_eq!(result["fps"], 60);
+    }
+
+    #[test]
+    fn test_action_log_writes_jsonl_and_is_reported_on_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("take.actions.jsonl");
+        let path = path.to_str().unwrap();
+        let mut state = RecordingState::new();
+        recording_start(&mut state, "/tmp/test.webm", options(None)).unwrap();
+        state.action_log = Some(ActionLog::open(path).unwrap());
+        for action in ["click", "fill"] {
+            state
+                .action_log
+                .as_mut()
+                .unwrap()
+                .append(&json!({ "action": action, "ok": true }));
+        }
+        state.frame_count = 1;
+
+        let result = recording_stop(&mut state).unwrap();
+        assert_eq!(result["actionLog"], path);
+        assert!(state.action_log.is_none());
+        let lines: Vec<Value> = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[1]["action"], "fill");
     }
 
     #[test]
