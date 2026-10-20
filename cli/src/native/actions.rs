@@ -10549,16 +10549,34 @@ async fn handle_getbyrole(cmd: &Value, state: &mut DaemonState) -> Result<Value,
         &state.iframe_sessions,
     );
 
-    let ax_tree: GetFullAXTreeResult = mgr
-        .client
-        .send_command_typed(
-            "Accessibility.getFullAXTree",
-            &ax_params,
-            Some(effective_session_id),
-        )
-        .await?;
-
-    let (backend_node_id, actual_name) = find_ax_node_by_role(&ax_tree.nodes, role, name, exact)?;
+    let allow_ambiguous = cmd
+        .get("allowAmbiguous")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut matches = Vec::new();
+    for attempt in 0..2 {
+        if attempt > 0 {
+            // Hydrating SSR pages briefly render duplicate controls; give the
+            // page a couple of frames before calling the query ambiguous.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let ax_tree: GetFullAXTreeResult = mgr
+            .client
+            .send_command_typed(
+                "Accessibility.getFullAXTree",
+                &ax_params,
+                Some(effective_session_id),
+            )
+            .await?;
+        matches = find_ax_node_by_role(&ax_tree.nodes, role, name, exact)?;
+        if matches.len() == 1 || allow_ambiguous {
+            break;
+        }
+    }
+    if matches.len() > 1 && !allow_ambiguous {
+        return Err(ambiguous_role_error(role, name, exact, &matches));
+    }
+    let (backend_node_id, actual_name) = matches.swap_remove(0);
 
     let ref_num = state.ref_map.next_ref_num();
     let temp_ref = format!("e{}", ref_num);
@@ -10575,6 +10593,28 @@ async fn handle_getbyrole(cmd: &Value, state: &mut DaemonState) -> Result<Value,
     let result = execute_subaction(cmd, state, &format!("@{}", temp_ref)).await;
     state.ref_map.remove(&temp_ref);
     result
+}
+
+/// Name every candidate so the agent can tighten the query instead of
+/// guessing a position with `find nth`.
+fn ambiguous_role_error(
+    role: &str,
+    name: Option<&str>,
+    exact: bool,
+    matches: &[(i64, String)],
+) -> String {
+    let shown: Vec<String> = matches
+        .iter()
+        .take(5)
+        .map(|(_, n)| format!("\"{}\"", n))
+        .collect();
+    let more = if matches.len() > 5 { ", ..." } else { "" };
+    format!(
+        "Ambiguous role match: {desc} matched {count} elements: {shown}{more}. Try `--exact`, a more specific `--name`, a CSS attribute selector (e.g. `click 'form button[type=\"submit\"]'`), or a snapshot ref (`snapshot -i`, then `click @eN`). Pass `--allow-ambiguous` to use the first match.",
+        desc = build_role_selector(role, name, exact),
+        count = matches.len(),
+        shown = shown.join(", "),
+    )
 }
 
 /// Map a Chrome AX tree role to its ARIA name. Divergences: `image` -> `img`
@@ -10602,15 +10642,17 @@ fn normalize_ws(s: &str) -> String {
 /// Playwright's getByRole semantics: role values are compared case-insensitively
 /// after AX-to-ARIA normalization; accessible names are whitespace-normalized on
 /// both sides, then non-exact matching is a case-insensitive substring check and
-/// exact matching is a case-sensitive whole-name comparison. Continues past AX
-/// nodes without a backendDOMNodeId (virtual nodes) so a later actionable match
-/// still wins.
+/// exact matching is a case-sensitive whole-name comparison. Returns every
+/// actionable match (one per DOM node, in tree order) so the caller can refuse
+/// an ambiguous query; AX nodes without a backendDOMNodeId (virtual nodes) are
+/// skipped.
 fn find_ax_node_by_role(
     nodes: &[super::cdp::types::AXNode],
     role: &str,
     name: Option<&str>,
     exact: bool,
-) -> Result<(i64, String), String> {
+) -> Result<Vec<(i64, String)>, String> {
+    let mut found: Vec<(i64, String)> = Vec::new();
     let mut matched_without_backend_id = false;
     // `names_seen` keeps first-seen order for the error message; `names_set` makes
     // the dedup check O(1) so a failed name query is linear, not quadratic, in the
@@ -10649,11 +10691,15 @@ fn find_ax_node_by_role(
             continue;
         }
 
-        if let Some(id) = node.backend_d_o_m_node_id {
-            return Ok((id, node_name));
+        match node.backend_d_o_m_node_id {
+            Some(id) if found.iter().all(|(seen, _)| *seen != id) => found.push((id, node_name)),
+            Some(_) => {}
+            None => matched_without_backend_id = true,
         }
+    }
 
-        matched_without_backend_id = true;
+    if !found.is_empty() {
+        return Ok(found);
     }
 
     if matched_without_backend_id {
@@ -10715,6 +10761,39 @@ async fn handle_semantic_locator(
         .and_then(|v| v.as_str())
         .ok_or(format!("Missing '{}' parameter", param_name))?;
     let exact = cmd.get("exact").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    // For "text" strategy, support interactive-element preference + multi-match
+    // surfacing so click-on-ambiguous-text fails loudly instead of silently
+    // picking the first DOM-order leaf.
+    if strategy == "text" {
+        let subaction = cmd
+            .get("subaction")
+            .and_then(|v| v.as_str())
+            .unwrap_or("click");
+        let is_click_like = matches!(subaction, "click" | "dblclick" | "hover" | "tap");
+        let prefer_interactive = cmd
+            .get("preferInteractive")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(is_click_like);
+        let allow_ambiguous = cmd
+            .get("allowAmbiguous")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let include_hidden = cmd
+            .get("includeHidden")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        return locate_text_with_disambiguation(
+            cmd,
+            state,
+            value,
+            exact,
+            prefer_interactive,
+            allow_ambiguous,
+            include_hidden,
+        )
+        .await;
+    }
 
     let match_fn = if exact {
         format!(
@@ -10832,6 +10911,204 @@ async fn handle_semantic_locator(
         .unwrap_or(false)
     {
         return Err(format!("No element found by {} '{}'", strategy, value));
+    }
+
+    let selector = "[data-agent-browser-located='true']";
+    let action_result = execute_subaction(cmd, state, selector).await;
+
+    if let Some(ref browser) = state.browser {
+        let _ = browser
+            .evaluate(
+                "document.querySelector('[data-agent-browser-located]')?.removeAttribute('data-agent-browser-located')",
+                None,
+            )
+            .await;
+    }
+
+    action_result
+}
+
+/// Selector covering the elements we treat as "interactive" when scoring
+/// candidates for `find text`. Mirrors the Playwright/aria heuristic — anything
+/// the user can plausibly click, focus, or activate.
+const INTERACTIVE_CSS_SELECTOR: &str = "a, button, [role=button], [role=link], input[type=submit], input[type=button], [onclick], [role=menuitem], [role=tab], [tabindex]:not([tabindex=\"-1\"])";
+
+/// JS helper that filters out invisible / aria-hidden / zero-rect candidates so
+/// SSR-hydration ghosts and hidden mobile-menu duplicates don't trigger
+/// spurious ambiguity errors. Inlined into the disambiguation IIFEs at use.
+const VISIBILITY_HELPER_JS: &str = r#"
+const isInteractable = (el) => {
+    if (!(el instanceof Element)) return false;
+    if (typeof el.checkVisibility === "function") {
+        if (!el.checkVisibility({ contentVisibilityAuto: true, visibilityProperty: true })) return false;
+    } else if (el.offsetParent === null && getComputedStyle(el).position !== "fixed") {
+        return false;
+    }
+    if (el.closest('[aria-hidden="true"], [hidden], [inert]')) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) return false;
+    return true;
+};
+"#;
+
+#[derive(Debug, serde::Deserialize)]
+struct LeafPreview {
+    tag: String,
+    role: String,
+    name: String,
+    html: String,
+    interactive: bool,
+    #[serde(default = "default_visible")]
+    visible: bool,
+}
+
+fn default_visible() -> bool {
+    true
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct LocateResult {
+    count: u64,
+    matches: Vec<LeafPreview>,
+    #[serde(default, rename = "hiddenCount")]
+    hidden_count: u64,
+}
+
+/// Locate a leaf by visible text with interactive-anchor preference and
+/// multi-match disambiguation. Replaces the original "first leaf wins"
+/// behaviour that silently mis-clicked when the same text appeared on a link
+/// and a nested button (or in headings + buttons).
+async fn locate_text_with_disambiguation(
+    cmd: &Value,
+    state: &mut DaemonState,
+    value: &str,
+    exact: bool,
+    prefer_interactive: bool,
+    allow_ambiguous: bool,
+    include_hidden: bool,
+) -> Result<Value, String> {
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let session_id = mgr.active_session_id()?.to_string();
+
+    let value_json = serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string());
+    let interactive_sel_json = serde_json::to_string(INTERACTIVE_CSS_SELECTOR)
+        .unwrap_or_else(|_| "\"\"".to_string());
+    let match_expr = if exact {
+        format!("el.textContent.trim() === {}", value_json)
+    } else {
+        format!("el.textContent.includes({})", value_json)
+    };
+
+    let js = format!(
+        r#"(async () => {{
+            {visibility_helper}
+            const INTERACTIVE_SEL = {interactive_sel};
+            const run = () => {{
+                const allLeaves = Array.from(document.querySelectorAll('*'))
+                    .filter(el => el.children.length === 0 && {match_expr});
+                const scored = allLeaves.map(el => {{
+                    const interactive = el.closest(INTERACTIVE_SEL);
+                    return {{ anchor: interactive || el, isInteractive: !!interactive }};
+                }});
+                const preferred = ({prefer_interactive} && scored.some(s => s.isInteractive))
+                    ? scored.filter(s => s.isInteractive)
+                    : scored;
+                const seen = new Set();
+                const allAnchors = [];
+                for (const s of preferred) {{
+                    if (!seen.has(s.anchor)) {{ seen.add(s.anchor); allAnchors.push(s.anchor); }}
+                }}
+                const candidates = {include_hidden} ? allAnchors : allAnchors.filter(isInteractable);
+                const hiddenCount = allAnchors.length - candidates.length;
+                const matches = candidates.slice(0, 5).map(el => ({{
+                    tag: el.tagName.toLowerCase(),
+                    role: el.getAttribute('role') || '',
+                    name: (el.getAttribute('aria-label') || el.textContent || '').trim().slice(0, 60),
+                    html: el.outerHTML.slice(0, 200),
+                    interactive: el.matches(INTERACTIVE_SEL),
+                    visible: isInteractable(el),
+                }}));
+                return {{ candidates, count: candidates.length, hiddenCount, matches }};
+            }};
+            let r = run();
+            if (r.count > 1) {{
+                await new Promise((res) => requestAnimationFrame(() => requestAnimationFrame(res)));
+                r = run();
+            }}
+            if (r.count === 1 || (r.count > 0 && {allow_ambiguous})) {{
+                r.candidates[0].setAttribute('data-agent-browser-located', 'true');
+            }}
+            return {{ count: r.count, hiddenCount: r.hiddenCount, matches: r.matches }};
+        }})()"#,
+        visibility_helper = VISIBILITY_HELPER_JS,
+        interactive_sel = interactive_sel_json,
+        match_expr = match_expr,
+        prefer_interactive = prefer_interactive,
+        allow_ambiguous = allow_ambiguous,
+        include_hidden = include_hidden,
+    );
+
+    let result: super::cdp::types::EvaluateResult = mgr
+        .client
+        .send_command_typed(
+            "Runtime.evaluate",
+            &super::cdp::types::EvaluateParams {
+                expression: js,
+                return_by_value: Some(true),
+                await_promise: Some(true),
+            },
+            Some(&session_id),
+        )
+        .await?;
+
+    let raw = result
+        .result
+        .value
+        .ok_or_else(|| "find text: empty CDP evaluation result".to_string())?;
+    let parsed: LocateResult = serde_json::from_value(raw)
+        .map_err(|e| format!("find text: invalid CDP evaluation result: {}", e))?;
+
+    if parsed.count == 0 {
+        if parsed.hidden_count > 0 {
+            return Err(format!(
+                "No visible element found by text '{}'. Found {} hidden matches (display:none / aria-hidden / zero-rect). Pass --include-hidden to match them anyway.",
+                value, parsed.hidden_count
+            ));
+        }
+        return Err(format!("No element found by text '{}'", value));
+    }
+
+    if parsed.count > 1 && !allow_ambiguous {
+        let mut detail = String::new();
+        for (i, m) in parsed.matches.iter().enumerate() {
+            detail.push_str(&format!(
+                "\n  [{}] <{}{}{}{}> {} — {}",
+                i,
+                m.tag,
+                if m.role.is_empty() {
+                    String::new()
+                } else {
+                    format!(" role=\"{}\"", m.role)
+                },
+                if m.interactive {
+                    " (interactive)"
+                } else {
+                    ""
+                },
+                if m.visible { "" } else { " hidden" },
+                if m.name.is_empty() {
+                    "(no name)".to_string()
+                } else {
+                    format!("\"{}\"", m.name)
+                },
+                m.html,
+            ));
+        }
+        return Err(format!(
+            "Ambiguous text match: '{val}' matched {n} elements:{detail}\nTry: `--exact`, `find role <role> click --name \"{val}\" --exact`, a CSS attribute selector (e.g. `click 'form button[type=\"submit\"]'`), or a snapshot ref (`agent-browser snapshot -i` then `click @eN`). Pass `--allow-ambiguous` to accept the first match.",
+            val = value,
+            n = parsed.count,
+        ));
     }
 
     let selector = "[data-agent-browser-located='true']";
@@ -14341,6 +14618,36 @@ mod tests {
         assert_eq!(normalize_ax_role("document"), "document");
     }
 
+    /// The first actionable match, which is what a non-ambiguous query acts on.
+    fn first_role_match(
+        nodes: &[AXNode],
+        role: &str,
+        name: Option<&str>,
+        exact: bool,
+    ) -> Result<(i64, String), String> {
+        find_ax_node_by_role(nodes, role, name, exact).map(|matches| matches[0].clone())
+    }
+
+    #[test]
+    fn find_ax_node_by_role_returns_every_match_once() {
+        let nodes = vec![
+            ax_node("button", "Login", Some(10), false),
+            ax_node("button", "Login with Google", Some(11), false),
+            ax_node("button", "Login", Some(10), false),
+            ax_node("button", "Login", Some(12), true),
+        ];
+
+        let matches = find_ax_node_by_role(&nodes, "button", Some("login"), false).unwrap();
+        assert_eq!(matches, [(10, "Login".to_string()), (11, "Login with Google".to_string())]);
+        let exact = find_ax_node_by_role(&nodes, "button", Some("Login"), true).unwrap();
+        assert_eq!(exact, [(10, "Login".to_string())]);
+
+        let err = ambiguous_role_error("button", Some("login"), false, &matches);
+        assert!(err.starts_with("Ambiguous role match"), "{err}");
+        assert!(err.contains("\"Login with Google\""), "{err}");
+        assert!(err.contains("--allow-ambiguous"), "{err}");
+    }
+
     #[test]
     fn find_ax_node_by_role_matches_browser_computed_implicit_roles() {
         let nodes = vec![
@@ -14350,12 +14657,12 @@ mod tests {
         ];
 
         let (backend_id, actual_name) =
-            find_ax_node_by_role(&nodes, "link", Some("Services"), true)
+            first_role_match(&nodes, "link", Some("Services"), true)
                 .expect("computed AX link role should match the anchor");
         assert_eq!(backend_id, 42);
         assert_eq!(actual_name, "Services");
 
-        let (backend_id, _) = find_ax_node_by_role(&nodes, "heading", None, false)
+        let (backend_id, _) = first_role_match(&nodes, "heading", None, false)
             .expect("role-only lookup should match the implicit heading");
         assert_eq!(backend_id, 43);
     }
@@ -14366,7 +14673,7 @@ mod tests {
 
         for query in ["Skills", "skills", "SKILLS", "kill"] {
             let (backend_id, actual_name) =
-                find_ax_node_by_role(&nodes, "heading", Some(query), false).unwrap_or_else(|e| {
+                first_role_match(&nodes, "heading", Some(query), false).unwrap_or_else(|e| {
                     panic!("expected case-insensitive match for {query:?}: {e}")
                 });
             assert_eq!(backend_id, 43);
@@ -14378,11 +14685,11 @@ mod tests {
     fn find_ax_node_by_role_exact_name_stays_case_sensitive() {
         let nodes = vec![ax_node("heading", "SKILLS", Some(43), false)];
 
-        let err = find_ax_node_by_role(&nodes, "heading", Some("Skills"), true)
+        let err = first_role_match(&nodes, "heading", Some("Skills"), true)
             .expect_err("exact matching must not ignore case");
         assert!(err.contains("Names seen: \"SKILLS\""));
 
-        let (backend_id, _) = find_ax_node_by_role(&nodes, "heading", Some("SKILLS"), true)
+        let (backend_id, _) = first_role_match(&nodes, "heading", Some("SKILLS"), true)
             .expect("exact match with identical case should still succeed");
         assert_eq!(backend_id, 43);
     }
@@ -14391,7 +14698,7 @@ mod tests {
     fn find_ax_node_by_role_matches_role_case_insensitively() {
         let nodes = vec![ax_node("heading", "Skills", Some(43), false)];
 
-        let (backend_id, _) = find_ax_node_by_role(&nodes, "Heading", None, false)
+        let (backend_id, _) = first_role_match(&nodes, "Heading", None, false)
             .expect("role matching should ignore case, same as name matching");
         assert_eq!(backend_id, 43);
     }
@@ -14402,11 +14709,11 @@ mod tests {
     fn find_ax_node_by_role_normalizes_ax_role_synonyms() {
         let nodes = vec![ax_node("image", "Logo", Some(51), false)];
 
-        let (backend_id, _) = find_ax_node_by_role(&nodes, "img", Some("Logo"), false)
+        let (backend_id, _) = first_role_match(&nodes, "img", Some("Logo"), false)
             .expect("the ARIA role name must match Chrome's AX role");
         assert_eq!(backend_id, 51);
 
-        let (backend_id, _) = find_ax_node_by_role(&nodes, "image", Some("Logo"), false)
+        let (backend_id, _) = first_role_match(&nodes, "image", Some("Logo"), false)
             .expect("the AX spelling keeps matching after normalization");
         assert_eq!(backend_id, 51);
     }
@@ -14417,11 +14724,11 @@ mod tests {
     fn find_ax_node_by_role_normalizes_whitespace_in_names() {
         let nodes = vec![ax_node("button", "Save   changes", Some(52), false)];
 
-        let (backend_id, _) = find_ax_node_by_role(&nodes, "button", Some("Save changes"), true)
+        let (backend_id, _) = first_role_match(&nodes, "button", Some("Save changes"), true)
             .expect("exact matching must normalize internal whitespace");
         assert_eq!(backend_id, 52);
 
-        let (backend_id, _) = find_ax_node_by_role(&nodes, "button", Some("save  changes"), false)
+        let (backend_id, _) = first_role_match(&nodes, "button", Some("save  changes"), false)
             .expect("substring matching must normalize internal whitespace");
         assert_eq!(backend_id, 52);
     }
@@ -14431,12 +14738,12 @@ mod tests {
         let nodes = vec![ax_node("button", "Submit form", Some(7), false)];
 
         let (backend_id, actual_name) =
-            find_ax_node_by_role(&nodes, "button", Some("submit"), false)
+            first_role_match(&nodes, "button", Some("submit"), false)
                 .expect("substring matching should be allowed without exact");
         assert_eq!(backend_id, 7);
         assert_eq!(actual_name, "Submit form");
 
-        let err = find_ax_node_by_role(&nodes, "button", Some("Submit"), true)
+        let err = first_role_match(&nodes, "button", Some("Submit"), true)
             .expect_err("exact matching should reject partial names");
         assert!(err.contains("Names seen: \"Submit form\""));
     }
@@ -14448,7 +14755,7 @@ mod tests {
             ax_node("link", "Services", None, false),
         ];
 
-        let err = find_ax_node_by_role(&nodes, "link", Some("Services"), true)
+        let err = first_role_match(&nodes, "link", Some("Services"), true)
             .expect_err("matching AX nodes must have a backend DOM node id");
         assert!(err.contains("no live DOM element"));
     }
@@ -14461,7 +14768,7 @@ mod tests {
         ];
 
         let (backend_id, actual_name) =
-            find_ax_node_by_role(&nodes, "link", Some("Services"), true)
+            first_role_match(&nodes, "link", Some("Services"), true)
                 .expect("lookup should continue past matching virtual AX nodes");
         assert_eq!(backend_id, 42);
         assert_eq!(actual_name, "Services");
@@ -14474,7 +14781,7 @@ mod tests {
             ax_node("heading", "Experience", Some(44), false),
         ];
 
-        let err = find_ax_node_by_role(&nodes, "heading", Some("Nope"), false)
+        let err = first_role_match(&nodes, "heading", Some("Nope"), false)
             .expect_err("no node should match an unrelated name");
         assert!(err.contains("2 elements have role \"heading\""));
         assert!(err.contains("Nope"));
@@ -14490,7 +14797,7 @@ mod tests {
             ax_node("heading", "Skills", Some(45), false),
         ];
 
-        let err = find_ax_node_by_role(&nodes, "heading", Some("Nope"), false)
+        let err = first_role_match(&nodes, "heading", Some("Nope"), false)
             .expect_err("no node should match an unrelated name");
         // 3 elements share the same name, so names_seen dedupes to 1 entry;
         // the element count must still say 3, not 1.
@@ -14509,7 +14816,7 @@ mod tests {
     fn find_ax_node_by_role_no_role_match_reports_role_selector() {
         let nodes = vec![ax_node("button", "Submit", Some(7), false)];
 
-        let err = find_ax_node_by_role(&nodes, "heading", Some("Nope"), false)
+        let err = first_role_match(&nodes, "heading", Some("Nope"), false)
             .expect_err("no node has this role at all");
         assert!(err.contains("getByRole('heading'"));
         assert!(err.contains("Nope"));

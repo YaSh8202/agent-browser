@@ -2428,6 +2428,12 @@ Options:
   --exact              Exact, case-sensitive match. For role it applies to
                        the accessible name, whose default is a case-insensitive
                        substring. The role value itself always ignores case.
+  --allow-ambiguous    role/text: act on the first match instead of failing
+                       when several elements match
+  --include-hidden     text: also match hidden elements (role never does)
+  --no-prefer-interactive
+                       text: don't prefer the clickable ancestor of a match
+                       (on by default for click and hover)
 
 Global Options:
   --json               Output as JSON
